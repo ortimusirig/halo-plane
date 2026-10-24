@@ -35,7 +35,7 @@ from plane.utils.exception_logger import log_exception
 from . import lease, live, ydoc
 from .edit import EditRefused, edit_page, sanitize
 
-EDIT_FIELDS = {"name", "description_html", "append_html", "expected_updated_at", "allow_removal"}
+EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
 CREATE_FIELDS = {"name", "description_html", "access"}
 
@@ -135,16 +135,24 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
                 "Halo's API changes only name and text (description_html or append_html), not: " + ", ".join(unknown),
                 "unsupported_field",
             )
-        replace, appended, name = (request.data.get(key) for key in ("description_html", "append_html", "name"))
-        if replace is not None and appended is not None:
-            return _error("Give description_html (replace) or append_html (add at the end), not both.", "invalid_field")
-        if replace is None and appended is None and name is None:
-            return _error("Give name, description_html or append_html.", "nothing_to_change")
-        if not all(value is None or isinstance(value, str) for value in (replace, appended, name)):
-            return _error("name, description_html and append_html must be text.", "invalid_field")
+        replace, appended, name, restore_id = (
+            request.data.get(key) for key in ("description_html", "append_html", "name", "restore_version_id")
+        )
+        if sum(value is not None for value in (replace, appended, restore_id)) > 1:
+            return _error("Give one of description_html (replace), append_html (add at the end) and "
+                          "restore_version_id (undo), not several.", "invalid_field")
+        if replace is None and appended is None and restore_id is None and name is None:
+            return _error("Give name, description_html, append_html or restore_version_id.", "nothing_to_change")
+        if not all(value is None or isinstance(value, str) for value in (replace, appended, name, restore_id)):
+            return _error("name, description_html, append_html and restore_version_id must be text.", "invalid_field")
         page = Page.objects.get(
             pk=page_id, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
         )
+        restore_from = None
+        if restore_id is not None:
+            restore_from = PageVersion.objects.filter(pk=restore_id, page_id=page.id).first()
+            if restore_from is None:
+                return _error("No such version of this page.", "unknown_version", status.HTTP_404_NOT_FOUND)
         try:
             result = edit_page(
                 page,
@@ -154,6 +162,7 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
                 name=name,
                 expected_updated_at=request.data.get("expected_updated_at"),
                 allow_removal=request.data.get("allow_removal") is True,
+                restore_from=restore_from,
             )
         except EditRefused as refused:
             return Response(refused.payload(), status=refused.status)
@@ -170,7 +179,17 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
         data["after_version_url"] = version_url(slug, project_id, page_id, result["after_version_id"])
         return Response(data, status=status.HTTP_200_OK)
 
+    def _in_a_hierarchy(self, page_id):
+        """Plane archives and unarchives a page with all its sub-pages and may detach it from its parent."""
+        page = Page.objects.filter(pk=page_id).only("parent_id").first()
+        if page and (page.parent_id or Page.objects.filter(parent_id=page_id).exists()):
+            return _error("This page has sub-pages or is one; archive or unarchive it in Halo, where the effect "
+                          "on the other pages is shown.", "page_hierarchy")
+        return None
+
     def archive(self, request, slug, project_id, page_id):
+        if refusal := self._in_a_hierarchy(page_id):
+            return refusal
         # Archived pages refuse saves, so an open editor's unsaved typing could never be stored.
         try:
             if live.is_open(page_id):
@@ -180,6 +199,11 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
             return _error("Halo's editor service is not reachable, so the page was not archived.",
                           "live_unavailable", status.HTTP_503_SERVICE_UNAVAILABLE)
         return super().archive(request, slug, project_id, page_id)
+
+    def unarchive(self, request, slug, project_id, page_id):
+        if refusal := self._in_a_hierarchy(page_id):
+            return refusal
+        return super().unarchive(request, slug, project_id, page_id)
 
 
 class HaloPageVersionEndpoint(PersonalTokenMixin, PageVersionEndpoint):

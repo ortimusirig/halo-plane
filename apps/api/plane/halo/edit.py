@@ -72,12 +72,21 @@ def _joined_json(old: dict, added: dict) -> dict:
 
 
 def edit_page(
-    page: Page, user, *, expected_updated_at, html=None, name=None, append=False, allow_removal=False
+    page: Page,
+    user,
+    *,
+    expected_updated_at,
+    html=None,
+    name=None,
+    append=False,
+    allow_removal=False,
+    restore_from=None,
 ) -> dict:
+    """restore_from: a PageVersion of this page whose text replaces the current text (an undo)."""
     _check(page, expected_updated_at)
     try:
         with lease.edit_lease(page.id):
-            return _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal)
+            return _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal, restore_from)
     except lease.PageBusy:
         raise EditRefused(409, "edit_in_progress", "Another edit of this page is in progress; try again shortly.")
 
@@ -91,7 +100,7 @@ def _check_size(html: str, binary) -> None:
         raise EditRefused(400, "page_too_large", f"The page would be too large after this edit: {error}")
 
 
-def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal) -> dict:
+def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal, restore_from) -> dict:
     if lease.text_behind(page.id):
         raise EditRefused(
             409, "page_text_behind",
@@ -101,7 +110,16 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
     clean = new_body = new_json = None
-    if html is not None:
+    if restore_from is not None:
+        # The version's own document, not its HTML: nothing in it passes through the sanitizer or converter.
+        clean = restore_from.description_html or "<p></p>"
+        new_json = restore_from.description_json or {}
+        if restore_from.description_binary:
+            new_body = bytes(restore_from.description_binary)
+        else:
+            new_body = live.convert_html(clean)[0]
+        html, append, allow_removal = clean, False, True  # an undo may remove what came after the version
+    elif html is not None:
         clean = sanitize(html) or "<p></p>"
         new_body, new_json = live.convert_html(clean)
 

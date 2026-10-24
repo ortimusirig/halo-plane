@@ -39,8 +39,8 @@ Halo. Only then switch the backend services to the image.
    | Route | Methods |
    | --- | --- |
    | `pages/` | GET list (paginated, with page links), POST create (name, description_html, access) |
-   | `pages/{page_id}/` | GET retrieve (HTML, plain text, link, embedded work items), PATCH name and/or text |
-   | `pages/{page_id}/archive/` | POST archive (refused while the page is open), DELETE unarchive |
+   | `pages/{page_id}/` | GET retrieve (HTML, plain text, link, embedded work items), PATCH name and/or text (replace, append or restore a version) |
+   | `pages/{page_id}/archive/` | POST archive (refused while the page is open), DELETE unarchive; both refused for pages with sub-pages |
    | `pages/{page_id}/versions/`, `pages/{page_id}/versions/{version_id}/` | GET (plain text added) |
 
    The views are Plane's own (`PageViewSet`, `PageVersionEndpoint`, their serializers and

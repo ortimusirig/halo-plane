@@ -22,13 +22,14 @@ ADMIN, MEMBER, GUEST = 20, 15, 5
 
 
 def doc_for(blocks):
-    """Stand-in for live's converter: a paragraph per text, an image block per ("image", src)."""
+    """Stand-in for live's converter: a paragraph per text, an imageComponent per ("image", src) (the
+    editor's node names, as live's converter writes them)."""
     doc = Doc()
     body = doc.get(ydoc.BODY, type=XmlFragment)
     with doc.transaction():
         for block in blocks:
             if isinstance(block, tuple):
-                body.children.append(XmlElement("image-component", {"src": block[1]}))
+                body.children.append(XmlElement("imageComponent", {"src": block[1]}))
             else:
                 body.children.append(XmlElement("paragraph", {})).children.append(XmlText()).insert(0, block)
     return doc.get_update()

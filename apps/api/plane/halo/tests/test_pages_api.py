@@ -376,3 +376,45 @@ def test_editor_load_waits_for_a_running_api_edit(world, api_client):
     waited = time.monotonic() - started
     thread.join()
     assert response.status_code == 200 and waited >= 0.4
+
+
+def test_restore_uses_the_version_document_itself(world, fake_live):
+    """An embedded work item would not survive Plane's HTML sanitizer; restoring from the document keeps it."""
+    from pycrdt import XmlElement
+
+    kept = Doc()
+    kept.apply_update(bytes(world.public.description_binary))
+    with kept.transaction():
+        kept.get(ydoc.BODY, type=XmlFragment).children.append(
+            XmlElement("issue-embed-component", {"entity_identifier": "w1"}))
+    version = PageVersion.objects.create(page=world.public, workspace=world.workspace, owned_by=world.owner.user,
+                                         description_html=ORIGINAL, description_binary=kept.get_update())
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(url, {"restore_version_id": str(version.id), "expected_updated_at": stamp},
+                                        format="json")
+    assert response.status_code == 200, response.content
+    restored = Page.objects.get(pk=world.public.pk).description_binary
+    assert ydoc.protected_parts(restored) == ydoc.protected_parts(kept.get_update())
+    assert fake_live.calls == []  # nothing went through HTML
+
+
+def test_restore_refuses_a_version_of_another_page(world):
+    other = world.make_page(world.owner, "Other", "<p>x</p>")
+    version = PageVersion.objects.create(page=other, workspace=world.workspace, owned_by=world.owner.user,
+                                         description_html="<p>x</p>")
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(url, {"restore_version_id": str(version.id), "expected_updated_at": stamp},
+                                        format="json")
+    assert (response.status_code, response.json()["code"]) == (404, "unknown_version")
+
+
+def test_archive_refuses_pages_with_sub_pages(world):
+    child = world.make_page(world.owner, "Child", "<p>c</p>")
+    Page.objects.filter(pk=child.pk).update(parent=world.public)
+    for page in (world.public, child):
+        url = f"{world.base}{page.id}/archive/"
+        assert world.owner.client.post(url).json()["code"] == "page_hierarchy"
+        assert world.admin.client.delete(url).json()["code"] == "page_hierarchy"
+    assert not Page.objects.filter(pk__in=[world.public.pk, child.pk], archived_at__isnull=False).exists()

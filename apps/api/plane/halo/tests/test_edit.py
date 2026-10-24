@@ -159,7 +159,7 @@ def test_edit_that_drops_or_swaps_an_image_is_refused_unless_allowed(world, fake
     with pytest.raises(edit.EditRefused) as refused:
         _edit(world, page=page, html='<p>Intro</p><image-component src="b2"></image-component>')
     assert (refused.value.status, refused.value.code) == (400, "would_remove_parts")
-    assert "image-component a1" in refused.value.message
+    assert "image a1" in refused.value.message
     assert _edit(world, page=page, html="<p>Intro</p>", allow_removal=True)["changed"]
 
 

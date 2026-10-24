@@ -23,11 +23,13 @@ from pycrdt import Doc, XmlElement, XmlFragment, XmlText
 BODY = "default"
 TITLE = "title"
 EDITOR_ID = "id"  # UniqueID's block id (packages/editor unique-id extension)
-# Page parts an edit must not drop by accident, and the attributes that say which one each is.
+# Page parts an edit must not drop by accident: Yjs elements are named after the editor's node types
+# (packages/editor/src/core/constants/extension.ts), with the attributes that say which one each is.
 PROTECTED_PARTS = {
-    "image-component": ("src",),
-    "mention-component": ("entity_name", "entity_identifier"),
-    "issue-embed-component": ("entity_identifier",),
+    "imageComponent": ("image", ("src",)),
+    "image": ("image", ("src",)),
+    "mention": ("mention", ("entity_name", "entity_identifier")),
+    "issue-embed-component": ("embedded work item", ("entity_identifier",)),
 }
 
 
@@ -224,8 +226,9 @@ def protected_parts(binary: bytes) -> Counter:
         for child in node.children:
             if isinstance(child, XmlElement):
                 if child.tag in PROTECTED_PARTS:
+                    label, keys = PROTECTED_PARTS[child.tag]
                     attributes = dict(child.attributes)
-                    parts[(child.tag,) + tuple(str(attributes.get(key)) for key in PROTECTED_PARTS[child.tag])] += 1
+                    parts[(label,) + tuple(str(attributes.get(key)) for key in keys)] += 1
                 walk(child)
 
     if binary:

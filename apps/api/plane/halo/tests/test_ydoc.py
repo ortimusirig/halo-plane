@@ -184,14 +184,22 @@ def test_append_adds_blocks_and_deletes_nothing():
 
 
 def image(src):
-    return ("image-component", {"src": src}, [])
+    return ("imageComponent", {"src": src}, [])
 
 
 def test_removed_parts_names_dropped_or_swapped_images():
     old = page(p("Alpha"), image("a1"), image("a2"))
     assert ydoc.removed_parts(old, page(p("Alpha"), image("a1"), image("a2"), p("More"))) == []
-    assert ydoc.removed_parts(old, page(p("Alpha"), image("a1"), image("zz"))) == ["image-component a2"]
-    assert ydoc.removed_parts(old, page(p("Alpha"))) == ["image-component a1", "image-component a2"]
+    assert ydoc.removed_parts(old, page(p("Alpha"), image("a1"), image("zz"))) == ["image a2"]
+    assert ydoc.removed_parts(old, page(p("Alpha"))) == ["image a1", "image a2"]
+
+
+def test_removed_parts_names_dropped_mentions():
+    def mention_block(user):
+        return ("paragraph", {}, [("Hi", None)]), ("mention", {"entity_name": "user_mention", "entity_identifier": user}, [])
+
+    old = page(*mention_block("u1"))
+    assert ydoc.removed_parts(old, page(p("Hi"))) == ["mention user_mention u1"]
 
 
 def test_missing_from_is_none_for_a_save_that_knows_everything():

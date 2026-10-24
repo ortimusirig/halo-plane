@@ -199,11 +199,11 @@ check("9b archive refused while the page is open", archivedOpen.status === 409 &
   JSON.stringify(archivedOpen));
 closeEditor(editorB);
 
-// 10. Undo through the API: the before version's HTML applied the same safe way.
+// 10. Undo through the API: the before version restored from its own document, the same safe way.
 await waitFor(() => closed(pageId));
 const beforeEdit = await page(pageId);
 const restored = await api("PATCH", `pages/${pageId}/`, {
-  description_html: before,
+  restore_version_id: edited.data.before_version_id,
   expected_updated_at: beforeEdit.updated_at,
 });
 const restoredHtml = (await page(pageId)).description_html;
