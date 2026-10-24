@@ -326,13 +326,14 @@ def test_first_load_of_a_page_too_large_for_the_converter_is_left_to_live(world,
     assert page.description_binary is None  # live converts it itself, as in stock Plane
 
 
-def test_first_load_fails_rather_than_let_live_convert_when_the_converter_is_down(world, fake_live, api_client):
+def test_first_load_is_left_to_live_when_the_converter_is_down(world, fake_live, api_client):
+    """Plane's load is never refused: live converts the page itself, as in stock Plane."""
     page = world.make_page(world.owner, "Fresh", "<p>x</p>", binary=False)
     fake_live.down = True
     api_client.force_authenticate(user=world.owner.user)
     url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
-    response = api_client.get(url)
-    assert (response.status_code, response.json()["code"]) == (503, "live_unavailable")
+    assert api_client.get(url).status_code == 200
+    assert Page.objects.get(pk=page.pk).description_binary is None
 
 
 def test_a_save_without_html_does_not_clear_the_lagging_mark(world, api_client):
@@ -402,11 +403,14 @@ def test_first_load_builds_the_document_from_the_html(world, fake_live, api_clie
     assert fake_live.calls == ["<p>One</p><p>Two</p>"]
 
 
-def test_editor_load_fails_rather_than_read_a_page_an_edit_still_holds(world, api_client):
+def test_editor_load_goes_on_after_waiting_for_a_long_api_edit(world, api_client):
+    """Plane's load is never refused; an edit that commits later reaches the editor through live."""
     api_client.force_authenticate(user=world.owner.user)
     with patch("plane.halo.lease.WAIT_SECONDS", 0.3), lease.edit_lease(world.public.id):
+        started = time.monotonic()
         response = api_client.get(_description_url(world))
-    assert (response.status_code, response.json()["code"]) == (503, "edit_in_progress")
+        waited = time.monotonic() - started
+    assert response.status_code == 200 and waited >= 0.25
 
 
 def test_editor_save_that_knows_everything_is_plane_unchanged(world, api_client):
@@ -687,18 +691,17 @@ def test_a_failed_copy_task_still_removes_the_mark(world):
     assert Page.objects.get(pk=copy.pk).description_html == IMAGE_HTML
 
 
-def test_duplicate_of_a_page_whose_text_is_behind_is_refused(world, api_client):
-    """A copy is made from the stored HTML; while that lags the document it would miss text."""
+def test_duplicate_works_as_in_plane_while_the_text_is_behind(world, api_client):
+    """Owner rule: Plane's duplicate is never refused (it copies the stored HTML, as in stock Plane)."""
     from django.utils import timezone
 
-    from plane.halo.models import PageBeingCopied, PageTextBehind
+    from plane.halo.models import PageTextBehind
 
     PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now())
     api_client.force_authenticate(user=world.owner.user)
-    pages = Page.objects.count()
     response = api_client.post(_app_page_url(world, "duplicate/"))
-    assert (response.status_code, response.json()["code"]) == (409, "page_text_behind")
-    assert Page.objects.count() == pages and not PageBeingCopied.objects.exists()
+    assert response.status_code == 201, response.content
+    assert Page.objects.get(pk=response.json()["id"]).description_html == ORIGINAL
 
 
 def test_duplicate_keeps_plane_s_private_page_rule(world, api_client):
@@ -727,7 +730,7 @@ def test_api_edit_of_a_page_being_copied_is_refused(world, fake_live):
     assert not PageVersion.objects.filter(page=world.public).exists()
 
 
-def test_editor_load_of_a_page_being_copied_waits_then_fails(world, api_client):
+def test_editor_load_of_a_page_being_copied_waits_then_loads(world, api_client):
     from django.utils import timezone
 
     from plane.halo.models import PageBeingCopied
@@ -735,8 +738,10 @@ def test_editor_load_of_a_page_being_copied_waits_then_fails(world, api_client):
     api_client.force_authenticate(user=world.owner.user)
     PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
     with patch("plane.halo.lease.WAIT_SECONDS", 0.3):
+        started = time.monotonic()
         response = api_client.get(_description_url(world))
-    assert (response.status_code, response.json()["code"]) == (503, "page_not_ready")
+        waited = time.monotonic() - started
+    assert response.status_code == 200 and waited >= 0.25
 
 
 def test_editor_load_waits_until_the_copy_task_ran(world, api_client):
@@ -772,17 +777,23 @@ def test_create_from_text_without_a_tag_stores_a_paragraph(world):
     assert Page.objects.get(pk=response.json()["id"]).description_html == "<p>Hello world</p>"
 
 
-def test_web_app_properties_patch_never_changes_the_text(world, api_client, no_celery):
-    """The web app's page store PATCHes the whole page, its own older copy of the text included."""
+def test_web_app_properties_patch_keeps_plane_s_behaviour_and_marks_changed_text(world, api_client):
+    """The web app's page store PATCHes the whole page, its own copy of the text included. Plane writes that
+    HTML (kept); the document stays, so Halo marks the page for its API."""
+    from plane.halo.models import PageTextBehind
+
     api_client.force_authenticate(user=world.owner.user)
     document = bytes(world.public.description_binary)
-    response = api_client.patch(_app_page_url(world), {"name": "Renamed", "description_html": "<p>Older text</p>",
-                                                       "description_binary": "AAAA"}, format="json")
-    assert response.status_code == 200, response.content
+    same = api_client.patch(_app_page_url(world), {"name": "Renamed", "description_html": ORIGINAL}, format="json")
+    assert same.status_code == 200, same.content
+    assert not PageTextBehind.objects.filter(page_id=world.public.id).exists()  # the same HTML: nothing to mark
+    older = api_client.patch(_app_page_url(world), {"description_html": "<p>Older text</p>"}, format="json")
+    assert older.status_code == 200, older.content
     page = Page.objects.get(pk=world.public.pk)
-    assert (page.name, page.description_html) == ("Renamed", ORIGINAL)
+    assert (page.name, page.description_html) == ("Renamed", "<p>Older text</p>")
     assert bytes(page.description_binary) == document
-    assert not any("new_description_html" in call.kwargs for call in no_celery.call_args_list)
+    assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["text_complete"] is False
 
 
 def test_a_save_of_html_alone_marks_the_text_as_behind(world, api_client):

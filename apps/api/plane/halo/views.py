@@ -42,9 +42,6 @@ from .models import PageBeingCopied, PageTextBehind
 from .tasks import finish_page_copy, track_page_version_after_save
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
-# A page's text, which the web app's properties PATCH carries along (its store sends the whole page) but only the
-# description endpoint may change.
-TEXT_FIELDS = ("description_html", "description_binary", "description_json")
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
 CREATE_FIELDS = {"name", "description_html", "access"}
 
@@ -265,17 +262,17 @@ class HaloAppPageViewSet(PageViewSet):
         Page.objects.select_for_update().filter(pk=page_id).first()
 
     def partial_update(self, request, slug, project_id, page_id):
-        # Plane's PageDetailSerializer would write description_html here, without the document: the web app's
-        # whole-page PATCH would put its older copy of the text back over an API edit.
-        data = request.data
-        if any(key in data for key in TEXT_FIELDS):
-            if hasattr(data, "_mutable"):
-                data._mutable = True
-            for key in TEXT_FIELDS:
-                data.pop(key, None)
         with transaction.atomic():
-            self._lock_row(page_id)
-            return super().partial_update(request, slug, project_id, page_id)
+            before = Page.objects.select_for_update().filter(pk=page_id).values_list("description_html", flat=True)
+            before = before.first()
+            response = super().partial_update(request, slug, project_id, page_id)
+            after = Page.objects.filter(pk=page_id).values_list("description_html", flat=True).first()
+            if after != before:
+                # Plane's page PATCH writes description_html without the document (the web app's store sends its
+                # whole copy of the page). Plane's behaviour is kept; the page is marked, so Halo's API reports
+                # text_complete false and waits until the next complete editor save.
+                PageTextBehind.objects.update_or_create(page_id=page_id, defaults={"since": timezone.now()})
+            return response
 
     def lock(self, request, slug, project_id, page_id):
         with transaction.atomic():
@@ -294,11 +291,10 @@ class HaloAppPageViewSet(PageViewSet):
 
 
 class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
-    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps), with three changes. The source page is
-    locked while it is copied, and refused while its stored HTML lags its document (a copy is made from the HTML,
-    so it would miss text). The copy task is Halo's finish_page_copy, which changes only the copy's HTML. Until it
-    has run, the copy is marked as being copied: editors' loads wait and API edits are refused, so the images are
-    copied before anyone opens the page."""
+    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps and answers), with two changes. The source
+    page is locked while it is copied. The copy task is Halo's finish_page_copy, which changes only the copy's HTML
+    (Plane's task saves the whole page it read, which could undo an API edit). Until it has run, the copy is marked
+    as being copied: API edits are refused, and editors' loads wait a moment so the images are copied first."""
 
     def post(self, request, slug, project_id, page_id):
         with transaction.atomic():
@@ -307,10 +303,6 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
             )
             if page.access == Page.PRIVATE_ACCESS and page.owned_by_id != request.user.id:
                 return Response({"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN)
-            if text_behind(page_id):
-                return Response({"error": "Halo is still taking in this page's latest text from an editor. Make any "
-                                          "small change in the page, then duplicate it again.",
-                                 "code": "page_text_behind"}, status=status.HTTP_409_CONFLICT)
             project_ids = list(ProjectPage.objects.filter(page_id=page_id).values_list("project_id", flat=True))
             page.pk = None
             page.name = f"{page.name} (Copy)"
@@ -368,26 +360,21 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
         ).first()
 
     def retrieve(self, request, slug, project_id, page_id):
-        if not lease.wait_until_free(page_id):
-            return _error("An edit of this page is still running; reload the page in a moment.",
-                          "edit_in_progress", status.HTTP_503_SERVICE_UNAVAILABLE)
+        # A load waits a moment for Halo's own work on the page (an API edit, or a new copy's copy task) and is
+        # never refused: past the wait it goes on as in Plane. An API edit that commits later still reaches the
+        # editor through live, and a save that missed it is merged.
+        lease.wait_until_free(page_id)
         deadline = time.monotonic() + lease.WAIT_SECONDS
-        while being_copied(page_id):
-            if time.monotonic() >= deadline:
-                return _error("Halo is still finishing this copied page; reload it in a moment.",
-                              "page_not_ready", status.HTTP_503_SERVICE_UNAVAILABLE)
+        while being_copied(page_id) and time.monotonic() < deadline:
             time.sleep(0.2)
         page = self._visible_page(request, slug, project_id, page_id)
         if page is not None and not page.description_binary:
             try:
                 ensure_document(page.pk)
-            except live.LiveTooLarge as error:
-                # Too large for live's converter: live converts the page itself, as in stock Plane. API edits
-                # of such a page are refused (they need the same converter), so none can race that.
+            except (live.LiveTooLarge, live.LiveUnavailable) as error:
+                # Left to live, which converts the page itself, as in stock Plane. API edits need a document
+                # (ensure_document) and are refused while the page is open, so none can race live's conversion.
                 log_exception(error)
-            except live.LiveUnavailable:
-                return _error("Halo's editor service could not prepare the page; reload it in a moment.",
-                              "live_unavailable", status.HTTP_503_SERVICE_UNAVAILABLE)
         return super().retrieve(request, slug, project_id, page_id)
 
     def partial_update(self, request, slug, project_id, page_id):

@@ -66,33 +66,34 @@ Halo. Only then switch the backend services to the image.
    - Each text edit writes a "before" and an "after" page version, marked so that Plane's version task never
      merges a later save into them (`plane/halo/versions.py`), restorable from the page's version history.
 
-3. Plane's page description endpoint, through which the web app and live load and save pages, is replaced by
-   a subclass (`HaloPagesDescriptionViewSet`, routed first by `plane/halo/app_urls.py`). Loading waits while an
-   API edit of the page runs. A save that lacks part of the stored document (an API edit that editor never
-   received) is merged with it instead of overwriting it, and the missing part is sent to that editor through
-   live. Such a save's HTML is that editor's older text, so the page is marked in Halo's own table
-   (`halo_page_text_behind`, same transaction) until that editor's next, complete save: reads report
-   `text_complete: false`, API edits wait, and the merged save makes no page version. A save of only one of
-   the document and its HTML marks the page the same way. A page's first document
-   is built here from its HTML (live's converter) when it is first loaded, so live never converts on its own
-   while an API edit writes the same page. The save itself mirrors Plane's code, with its background tasks
-   started after commit. Plane's other web-app routes that save a whole page (properties, lock, access) run
-   Plane's own code through a subclass (`HaloAppPageViewSet`) that locks the page's row before Plane reads it,
-   so none of them can write old text back over an API edit that committed in between. The properties route
-   also drops the page's text from the request (the web app sends its whole copy of the page, text included):
-   text changes only go through the description endpoint.
+3. Plane's web-app page routes that load or save a page (description, the page itself, lock, access,
+   duplicate) are answered first by subclasses of Plane's own views (`plane/halo/app_urls.py`), with the same
+   paths, methods and answers. Existing behaviour stays as in Plane: nothing there is refused or sanitised
+   beyond Plane's own checks; Halo only waits, locks and marks, for the sake of its API.
 
-   Plane's page duplicate runs through a subclass too (`HaloPageDuplicateEndpoint`, Plane's steps). It locks the
-   source page and refuses (`page_text_behind`) while the source's stored HTML lags its document, since a copy
-   is made from the HTML. Plane's copy task (it copies the images, then saves the whole page it read, twice) is
-   replaced for pages by Halo's `finish_page_copy`, built from Plane's own helpers: it copies the images and
-   points the copy's HTML at them in one update of the HTML alone, made only if the text is unchanged and the
-   page has no document yet. So it never writes back a name, archive, lock or access change, nor overwrites an
-   edit, however late it runs. The copy's document is built from its HTML on the first load, as for every new
-   page. Until the task has run the copy is marked in a second table (`halo_page_being_copied`), so the images
-   are copied before anyone opens it: API edits are refused (`page_not_ready`) and editors' loads wait up to 15
-   seconds; a mark older than two minutes (a stuck or dead worker) is ignored, and the copy then keeps showing
-   the original's images.
+   - Loading a page (`HaloPagesDescriptionViewSet`) waits a moment while an API edit of it runs or a new copy's
+     copy task runs (at most 15 seconds each), then goes on as in Plane. A page without a document gets one
+     built from its HTML by live's converter; if that converter fails, live converts the page itself, as in
+     stock Plane.
+   - Saving mirrors Plane's code, with its background tasks started after commit. A save that lacks part of the
+     stored document (an API edit that editor never received) is merged with it instead of overwriting it, and
+     the missing part is sent to that editor through live. When the stored HTML and document disagree (such a
+     merged save, or a save of only one of them) the page is marked in Halo's own table
+     (`halo_page_text_behind`, same transaction) until a save of both: Halo's API then reports
+     `text_complete: false` and its edits wait, and the merged save makes no page version.
+   - Properties, lock and access run Plane's own code after locking the page's row, so none of them can write
+     old text back over an API edit that committed in between. The properties PATCH writes `description_html`
+     as in Plane (the web app's store sends its whole copy of the page); when that changes the HTML, the page
+     is marked as above.
+   - Duplicate (`HaloPageDuplicateEndpoint`) repeats Plane's steps and locks the source page. Plane's copy task
+     (it copies the images, then saves the whole page it read, twice) is replaced for pages by Halo's
+     `finish_page_copy`, built from Plane's own helpers: it copies the images and points the copy's HTML at
+     them in one update of the HTML alone, made only if the text is unchanged and the page has no document yet.
+     So it never writes back a name, archive, lock or access change, nor overwrites an edit, however late it
+     runs. The copy's document is built from its HTML on the first load, as for every new page. Until the task
+     has run the copy is marked in a second table (`halo_page_being_copied`): API edits of it are refused
+     (`page_not_ready`) and loads wait as above; a mark older than two minutes (a stuck or dead worker) is
+     ignored, and the copy then keeps showing the original's images.
 
 4. Fix of Plane CE v1.4.2's page version history: `bgtasks/page_version_task.py` read `page.description`,
    which does not exist (`description_json` does), so no page version was ever written. The same task skips
@@ -106,7 +107,7 @@ Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with two tables
 Known limits: typing on an open page can be lost only where an API edit rewrote the same characters while
 live missed the half-second open-page probe. Pages over 100 kB of HTML (live's converter limit) cannot be
 edited through the API, and their first document is built by live itself, as in stock Plane. A marked page
-stays marked until an editor saves it again (any small change), and cannot be duplicated until then.
+stays marked until an editor saves it again (any small change).
 Background tasks go through Plane's broker, as in Plane. When it is down, a change made through Halo's routes
 is still saved and answered once; its mentions index (`page_transaction`), version task or a copy's image
 copies are skipped and logged.
