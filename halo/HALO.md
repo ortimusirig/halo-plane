@@ -31,9 +31,11 @@ build (this build: `halo-v1.4.2-pages.1`). The Halo image carries the tag and th
    document, and browsers keep a copy of it, so an edit is a Yjs update on that same document: the live
    service converts the new HTML (`/live/convert-document/`, the editor's own schema) and only the
    top-level blocks that differ are replaced (`plane/halo/ydoc.py`, pycrdt). An edit is refused while
-   the page is locked, archived, open in Halo (a subscriber on live's Redis channel
-   `hocuspocus:<page_id>`) or saved since the caller read it (`expected_updated_at`). After the save the
-   update is published on that channel, so an editor that opened the page at that moment receives it.
+   the page is locked, archived, open in Halo or saved since the caller read it (`expected_updated_at`).
+   "Open" means a live server holds the page: it answers a Hocuspocus QueryAwareness message on live's
+   Redis channel `hocuspocus:<page_id>` (live stays subscribed to that channel after a page closes, so the
+   subscriber count alone is not used). After the save the update is published on that channel, so an
+   editor that opened the page at that moment receives it.
    Each body edit writes a "before" and an "after" page version (`plane/halo/versions.py`), restorable
    from the page's version history in Halo.
 
