@@ -4,7 +4,8 @@
 
 """A name or body edit through the API that people's open and cached editors can merge.
 
-Refused while the page is locked, archived, open in Halo, or saved since the caller read it. The new HTML is
+Every edit carries expected_updated_at, the page's updated_at when the caller read it. Refused while the page is
+locked, archived, open in Halo, or saved since the caller read it. The new HTML is
 sanitized like Plane's own description endpoint, converted by live, and applied as a Yjs update on the page's
 document (ydoc). The update is published on live's channel after commit, and again a few seconds later, so an
 editor that opened the page in that moment still receives it.
@@ -46,12 +47,15 @@ def _check(page: Page, expected_updated_at) -> None:
         raise EditRefused(400, "page_locked", "The page is locked in Halo; it must be unlocked there first.")
     if page.archived_at:
         raise EditRefused(400, "page_archived", "The page is archived; unarchive it before editing.")
-    if expected_updated_at is not None:
-        expected = parse_datetime(str(expected_updated_at))
-        if expected is None:
-            raise EditRefused(400, "invalid_expected_updated_at", "expected_updated_at must be the page's updated_at.")
-        if expected != page.updated_at:
-            raise EditRefused(409, "page_changed", "The page changed since it was read; read it again first.")
+    # Every edit names the version it was made on, so a save in Halo since then is never overwritten.
+    if not expected_updated_at:
+        raise EditRefused(400, "expected_updated_at_required",
+                          "Give expected_updated_at: the page's updated_at from when it was read.")
+    expected = parse_datetime(str(expected_updated_at))
+    if expected is None:
+        raise EditRefused(400, "invalid_expected_updated_at", "expected_updated_at must be the page's updated_at.")
+    if expected != page.updated_at:
+        raise EditRefused(409, "page_changed", "The page changed since it was read; read it again first.")
 
 
 def _publish(page_id, update: bytes):
@@ -62,7 +66,7 @@ def _publish(page_id, update: bytes):
         return None
 
 
-def edit_page(page: Page, user, *, html=None, name=None, expected_updated_at=None) -> dict:
+def edit_page(page: Page, user, *, expected_updated_at, html=None, name=None) -> dict:
     _check(page, expected_updated_at)
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")

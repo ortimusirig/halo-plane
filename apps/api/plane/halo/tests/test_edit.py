@@ -14,10 +14,13 @@ from plane.halo.tests.conftest import doc_for, live_channel
 ORIGINAL = "<p>Alpha</p><p>Beta</p><p>Gamma</p>"
 
 
-def _edit(world, **kwargs):
+def _edit(world, page=None, **kwargs):
+    """Edit as the owner, by default on the page as it is now (the read the caller made)."""
+    page = Page.objects.get(pk=(page or world.public).pk)
+    kwargs.setdefault("expected_updated_at", page.updated_at.isoformat())
     # In a request Plane's middleware sets the current user (crum); here the test does.
     with impersonate(world.owner.user):
-        return edit.edit_page(Page.objects.get(pk=world.public.pk), world.owner.user, **kwargs)
+        return edit.edit_page(page, world.owner.user, **kwargs)
 
 
 @pytest.mark.django_db
@@ -52,9 +55,21 @@ def test_stale_read_is_refused(world, fake_live):
 
 
 @pytest.mark.django_db
-def test_matching_read_is_accepted(world, fake_live):
-    stamp = Page.objects.get(pk=world.public.pk).updated_at.isoformat()
-    assert _edit(world, html="<p>Other</p>", expected_updated_at=stamp)["changed"]
+def test_matching_read_in_another_timezone_is_accepted(world, fake_live):
+    from datetime import timedelta, timezone
+
+    stamp = Page.objects.get(pk=world.public.pk).updated_at.astimezone(timezone(timedelta(hours=5, minutes=30)))
+    assert _edit(world, html="<p>Other</p>", expected_updated_at=stamp.isoformat())["changed"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("stamp,code", [(None, "expected_updated_at_required"), ("", "expected_updated_at_required"),
+                                        ("yesterday", "invalid_expected_updated_at")])
+def test_edit_without_a_valid_read_stamp_is_refused(world, fake_live, stamp, code):
+    with pytest.raises(edit.EditRefused) as refused:
+        _edit(world, html="<p>Other</p>", expected_updated_at=stamp)
+    assert (refused.value.status, refused.value.code) == (400, code)
+    assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
 
 
 @pytest.mark.django_db
@@ -80,7 +95,7 @@ def test_live_down_changes_nothing(world, fake_live):
 @pytest.mark.django_db
 def test_page_never_opened_keeps_an_empty_document(world, fake_live):
     page = world.make_page(world.owner, "Fresh", "<p>One</p>", binary=False)
-    result = edit.edit_page(page, world.owner.user, html="<p>Two</p>")
+    result = _edit(world, page=page, html="<p>Two</p>")
     page.refresh_from_db()
     assert result["changed"]
     assert page.description_binary is None
@@ -99,6 +114,20 @@ def test_script_is_sanitized_before_conversion(world, fake_live):
     _edit(world, html="<p>Alpha</p><script>alert(1)</script><p>Beta</p><p>Gamma 2</p>")
     assert "<script" not in fake_live.calls[0]
     assert "<script" not in Page.objects.get(pk=world.public.pk).description_html
+
+
+@pytest.mark.django_db
+def test_unsafe_links_frames_and_handlers_are_removed_but_page_parts_stay(world, fake_live):
+    _edit(world, html=(
+        '<p>Alpha</p><p><a href="javascript:alert(1)">bad</a> <a href="https://ok.test/">ok</a></p>'
+        '<iframe src="https://evil.test/"></iframe><p onclick="alert(1)">Gamma</p>'
+        '<image-component src="11111111-1111-4111-8111-111111111111"></image-component>'
+        '<p><mention-component id="m1" entity_identifier="u1" entity_name="user_mention"></mention-component></p>'))
+    html = Page.objects.get(pk=world.public.pk).description_html
+    for unsafe in ("javascript:", "<iframe", "onclick"):
+        assert unsafe not in html
+    for kept in ('href="https://ok.test/"', "<image-component", "<mention-component"):
+        assert kept in html
 
 
 @pytest.mark.django_db

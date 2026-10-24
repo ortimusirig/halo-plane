@@ -4,7 +4,7 @@
 
 import pytest
 
-from plane.db.models import Page, Project
+from plane.db.models import APIToken, Page, PageVersion, Project, ProjectMember, ProjectPage
 from plane.halo.tests.conftest import live_channel
 
 pytestmark = pytest.mark.django_db
@@ -97,8 +97,15 @@ def test_edit_returns_versions_and_links(world, fake_live):
 
 def test_edit_refusals_have_codes(world, fake_live):
     url = f"{world.base}{world.public.id}/"
+    stamp = world.member.client.get(url).json()["updated_at"]
+    missing = world.member.client.patch(url, {"description_html": "<p>x</p>"}, format="json")
+    assert (missing.status_code, missing.json()["code"]) == (400, "expected_updated_at_required")
+    renamed = world.member.client.patch(url, {"name": "x"}, format="json")
+    assert (renamed.status_code, renamed.json()["code"]) == (400, "expected_updated_at_required")
     with live_channel(world.public.id):
-        response = world.member.client.patch(url, {"description_html": "<p>x</p>"}, format="json")
+        response = world.member.client.patch(
+            url, {"description_html": "<p>x</p>", "expected_updated_at": stamp}, format="json"
+        )
         assert world.member.client.get(url).json()["is_open"] is True
     assert (response.status_code, response.json()["code"]) == (409, "page_open")
     stale = world.member.client.patch(
@@ -106,7 +113,7 @@ def test_edit_refusals_have_codes(world, fake_live):
     )
     assert (stale.status_code, stale.json()["code"]) == (409, "page_changed")
     fake_live.down = True
-    down = world.member.client.patch(url, {"description_html": "<p>x</p>"}, format="json")
+    down = world.member.client.patch(url, {"description_html": "<p>x</p>", "expected_updated_at": stamp}, format="json")
     assert (down.status_code, down.json()["code"]) == (503, "live_unavailable")
     assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
 
@@ -130,3 +137,56 @@ def test_archive_follows_plane_rule_owner_or_admin(world):
 
 def test_no_delete_route(world):
     assert world.admin.client.delete(f"{world.base}{world.public.id}/").status_code == 405
+
+
+def test_create_removes_unsafe_links_frames_and_handlers(world):
+    response = world.member.client.post(world.base, {"name": "x", "description_html": (
+        '<p><a href="javascript:alert(1)">bad</a></p><iframe src="https://evil.test/"></iframe>'
+        '<p onmouseover="alert(1)">hi</p><p><a href="https://ok.test/">ok</a></p>')}, format="json")
+    html = Page.objects.get(pk=response.json()["id"]).description_html
+    for unsafe in ("javascript:", "<iframe", "onmouseover"):
+        assert unsafe not in html
+    assert 'href="https://ok.test/"' in html
+
+
+def test_ids_from_another_project_are_refused(world, fake_live):
+    """A page, or a version of it, in project B is never reached through project A's routes."""
+    other = Project.objects.create(name="Other", identifier="OT", workspace=world.workspace)
+    ProjectMember.objects.create(project=other, workspace=world.workspace, member=world.member.user, role=15)
+    elsewhere = Page.objects.create(workspace=world.workspace, name="B", owned_by=world.member.user,
+                                    description_html="<p>B</p>")
+    ProjectPage.objects.create(workspace=world.workspace, project=other, page=elsewhere)
+    version = PageVersion.objects.create(page=elsewhere, workspace=world.workspace, owned_by=world.member.user,
+                                         description_html="<p>B</p>")
+    url = f"{world.base}{elsewhere.id}/"
+    stamp = elsewhere.updated_at.isoformat()
+    assert world.member.client.get(url).status_code == 403
+    assert world.member.client.patch(url, {"name": "x", "expected_updated_at": stamp},
+                                     format="json").status_code == 403
+    assert world.member.client.post(f"{url}archive/").status_code == 403
+    assert world.member.client.get(f"{url}versions/").status_code == 403
+    # A version id of page B under page A's route.
+    response = world.member.client.get(f"{world.base}{world.public.id}/versions/{version.id}/")
+    assert response.status_code == 404
+    elsewhere.refresh_from_db()
+    assert (elsewhere.name, elsewhere.archived_at) == ("B", None)
+
+
+def test_removed_member_and_revoked_token_lose_access(world):
+    url = f"{world.base}{world.public.id}/"
+    ProjectMember.objects.filter(project=world.project, member=world.member.user).update(is_active=False)
+    assert world.member.client.get(url).status_code == 403
+    assert world.member.client.get(world.base).status_code == 403
+    APIToken.objects.filter(user=world.owner.user).update(is_active=False)
+    assert world.owner.client.get(url).status_code in (401, 403)
+
+
+def test_owner_can_edit_own_private_page_but_admin_cannot_read_others_private(world, fake_live):
+    mine = world.make_page(world.member, "Mine", "<p>Private</p>", access=1)
+    url = f"{world.base}{mine.id}/"
+    stamp = world.member.client.get(url).json()["updated_at"]
+    response = world.member.client.patch(url, {"description_html": "<p>Private, edited</p>",
+                                               "expected_updated_at": stamp}, format="json")
+    assert response.status_code == 200, response.content
+    assert world.admin.client.get(url).status_code == 403
+    assert world.admin.client.get(f"{url}versions/").status_code == 403

@@ -10,6 +10,14 @@ Source for Halo users (AGPL section 13): https://github.com/ortimusirig/halo-pla
 build (this build: `halo-v1.4.2-pages.1`). The Halo image carries the tag and the commit in its
 `org.opencontainers.image.version` and `org.opencontainers.image.revision` labels.
 
+The tag is the complete Corresponding Source of the running backend, free to download as a zip
+(`https://github.com/ortimusirig/halo-plane/archive/refs/tags/halo-v1.4.2-pages.1.zip`): Plane's full
+source at `v1.4.2` with its LICENSE and notices (Plane's `apps/api/Dockerfile.api` builds the upstream
+image `makeplane/plane-backend:v1.4.2`), Applexus' changes, and the scripts that build and install the
+Halo image (`halo/build-backend.sh`, `halo/Dockerfile.backend`, `halo/requirements-halo.txt`, which pins
+pycrdt, MIT, by hash). Halo shows the link on every page (Applexus' halo.js) and in AURA's Halo guide.
+Each Halo build gets a new tag, and both links move to it.
+
 ## What changes
 
 1. Project page routes for API v1, signed in with a personal access token (`X-Api-Key`), under

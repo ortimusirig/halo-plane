@@ -109,7 +109,10 @@ await waitFor(() => blocks(docA).length === 3);
 check("2 editor opens the page", JSON.stringify(blocks(docA)) === '["Alpha","Beta","Gamma"]', JSON.stringify(blocks(docA)));
 
 // 3. An API edit while A has it open is refused, and nothing changes.
-const refused = await api("PATCH", `pages/${pageId}/`, { description_html: "<p>Alpha</p><p>Beta X</p><p>Gamma</p>" });
+const refused = await api("PATCH", `pages/${pageId}/`, {
+  description_html: "<p>Alpha</p><p>Beta X</p><p>Gamma</p>",
+  expected_updated_at: (await page(pageId)).updated_at,
+});
 check("3a edit refused while open", refused.status === 409 && refused.data.code === "page_open", JSON.stringify(refused));
 await sleep(1000);
 check("3b editor and stored text unchanged",
