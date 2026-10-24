@@ -63,7 +63,7 @@ services:
       plane-mq: {condition: service_started}
 
   live:
-    image: makeplane/plane-live:v1.4.2
+    image: ${PLANE_LIVE_IMAGE:-makeplane/plane-live:v1.4.2}
     environment:
       API_BASE_URL: http://api:8000
       REDIS_URL: redis://plane-redis:6379/

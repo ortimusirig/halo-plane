@@ -11,7 +11,7 @@ export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 root=$(pwd -W 2>/dev/null || pwd)
 
-base=plane-backend-halo:v1.4.2-pages.1
+base=${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.1}
 mount=()
 if [ "${1:-}" = "--dev" ]; then
   shift
