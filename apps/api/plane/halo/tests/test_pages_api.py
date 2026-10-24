@@ -549,3 +549,144 @@ def test_a_lock_click_during_an_api_edit_does_not_write_the_old_text_back(world,
     page = Page.objects.get(pk=world.public.pk)
     assert page.is_locked is True
     assert page.description_html == "<p>Written by the API</p>"
+
+
+def test_a_save_without_html_marks_the_text_as_behind(world, api_client):
+    """A save of the document alone leaves the stored HTML older than the document it saved."""
+    from plane.halo.models import PageTextBehind
+
+    api_client.force_authenticate(user=world.owner.user)
+    current = Doc()
+    current.apply_update(bytes(world.public.description_binary))
+    text = current.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")
+    binary_only = {"description_binary": base64.b64encode(current.get_update()).decode()}
+    assert api_client.patch(_description_url(world), binary_only, format="json").status_code == 200
+    assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["text_complete"] is False
+
+
+def test_create_in_an_archived_project_is_refused_and_creates_nothing(world):
+    from django.utils import timezone
+
+    pages = Page.objects.count()
+    Project.objects.filter(pk=world.project.pk).update(archived_at=timezone.now())
+    response = world.owner.client.post(world.base, {"name": "New", "description_html": "<p>x</p>"}, format="json")
+    assert (response.status_code, response.json()["code"]) == (404, "project_not_found")
+    assert Page.objects.count() == pages
+
+
+def test_create_commits_nothing_when_the_answer_cannot_be_built(world, no_celery):
+    from plane.halo.views import HaloProjectPageViewSet
+
+    pages = Page.objects.count()
+    with patch.object(HaloProjectPageViewSet, "get_queryset", return_value=Page.objects.none()):
+        response = world.owner.client.post(world.base, {"name": "New"}, format="json")
+    assert response.status_code == 404
+    assert Page.objects.count() == pages
+    no_celery.assert_not_called()
+
+
+def test_duplicate_is_halo_s_and_marks_the_copy_until_its_copy_task_ran(world, api_client, no_celery):
+    from django.urls import resolve
+
+    from plane.halo.models import PageBeingCopied
+    from plane.halo.tasks import finish_page_copy
+    from plane.halo.views import HaloPageDuplicateEndpoint
+
+    assert resolve(_app_page_url(world, "duplicate/")).func.view_class is HaloPageDuplicateEndpoint
+    api_client.force_authenticate(user=world.owner.user)
+    response = api_client.post(_app_page_url(world, "duplicate/"))
+    assert response.status_code == 201, response.content
+    copy = Page.objects.get(pk=response.json()["id"])
+    assert (copy.name, copy.description_html, copy.description_binary) == ("Plan (Copy)", ORIGINAL, None)
+    assert ProjectPage.objects.filter(page=copy, project=world.project).exists()
+    assert PageBeingCopied.objects.filter(page_id=copy.id).exists()
+    queued = [call.kwargs for call in no_celery.call_args_list]
+    # Plane's copy task is not queued itself: Halo's finish_page_copy runs it, then removes the mark.
+    assert not any("entity_name" in kwargs for kwargs in queued)
+    copy_kwargs = next(kwargs for kwargs in queued if set(kwargs) == {"page_id", "project_id", "slug", "user_id"})
+    with patch("plane.halo.tasks.copy_s3_objects_of_description_and_assets") as plane_copy:
+        finish_page_copy(**copy_kwargs)
+    plane_copy.assert_called_once_with(entity_name="PAGE", entity_identifier=copy.id, project_id=world.project.id,
+                                       slug=world.workspace.slug, user_id=world.owner.user.id)
+    assert not PageBeingCopied.objects.filter(page_id=copy.id).exists()
+
+
+def test_a_failed_copy_task_still_removes_the_mark(world):
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+    from plane.halo.tasks import finish_page_copy
+
+    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
+    with patch("plane.halo.tasks.copy_s3_objects_of_description_and_assets", side_effect=RuntimeError("s3")):
+        with pytest.raises(RuntimeError):
+            finish_page_copy(page_id=world.public.id, project_id=world.project.id, slug=world.workspace.slug,
+                             user_id=world.owner.user.id)
+    assert not PageBeingCopied.objects.filter(page_id=world.public.id).exists()
+
+
+def test_duplicate_keeps_plane_s_private_page_rule(world, api_client):
+    from plane.halo.models import PageBeingCopied
+
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{world.private.id}/duplicate/"
+    pages = Page.objects.count()
+    assert api_client.post(url).status_code == 403
+    assert Page.objects.count() == pages and not PageBeingCopied.objects.exists()
+
+
+def test_api_edit_of_a_page_being_copied_is_refused(world, fake_live):
+    """Plane's copy task saves the whole page it read, so an edit before it finished would be overwritten."""
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
+    response = world.owner.client.patch(url, {"description_html": "<p>new</p>", "expected_updated_at": stamp},
+                                        format="json")
+    assert (response.status_code, response.json()["code"]) == (409, "page_not_ready")
+    assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
+    assert not PageVersion.objects.filter(page=world.public).exists()
+
+
+def test_editor_load_of_a_page_being_copied_waits_then_fails(world, api_client):
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+
+    api_client.force_authenticate(user=world.owner.user)
+    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
+    with patch("plane.halo.lease.WAIT_SECONDS", 0.3):
+        response = api_client.get(_description_url(world))
+    assert (response.status_code, response.json()["code"]) == (503, "page_not_ready")
+
+
+def test_editor_load_waits_until_the_copy_task_ran(world, api_client):
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.views.being_copied", side_effect=[True, True, False]) as copying, \
+            patch("plane.halo.views.time.sleep") as sleep:
+        response = api_client.get(_description_url(world))
+    assert response.status_code == 200
+    assert copying.call_count == 3 and sleep.call_count == 2
+
+
+def test_a_copy_mark_older_than_an_hour_is_ignored(world, fake_live, api_client):
+    """A worker that died mid-copy never removes its mark; after an hour the page is usable again."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+
+    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now() - timedelta(hours=2))
+    api_client.force_authenticate(user=world.owner.user)
+    assert api_client.get(_description_url(world)).status_code == 200
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(url, {"description_html": "<p>new</p>", "expected_updated_at": stamp},
+                                        format="json")
+    assert response.status_code == 200, response.content

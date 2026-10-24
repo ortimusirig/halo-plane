@@ -7,7 +7,7 @@ included before plane.app.urls, so they answer first. Same paths and methods as 
 
 from django.urls import path
 
-from .views import HaloAppPageViewSet, HaloPagesDescriptionViewSet
+from .views import HaloAppPageViewSet, HaloPageDuplicateEndpoint, HaloPagesDescriptionViewSet
 
 PAGE = "workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/"
 
@@ -19,6 +19,7 @@ urlpatterns = [
     ),
     path(f"{PAGE}lock/", HaloAppPageViewSet.as_view({"post": "lock", "delete": "unlock"}), name="halo-app-page-lock"),
     path(f"{PAGE}access/", HaloAppPageViewSet.as_view({"post": "access"}), name="halo-app-page-access"),
+    path(f"{PAGE}duplicate/", HaloPageDuplicateEndpoint.as_view(), name="halo-page-duplicate"),
     path(
         f"{PAGE}description/",
         HaloPagesDescriptionViewSet.as_view({"get": "retrieve", "patch": "partial_update"}),

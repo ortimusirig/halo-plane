@@ -12,8 +12,10 @@ editor that opened the page in that moment still receives it.
 """
 
 import threading
+from datetime import timedelta
 
 from django.db import transaction
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from plane.bgtasks.page_transaction_task import page_transaction
@@ -22,7 +24,7 @@ from plane.utils.content_validator import validate_binary_data, validate_html_co
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, versions, ydoc
-from .models import PageTextBehind
+from .models import PageBeingCopied, PageTextBehind
 
 REPUBLISH_AFTER_SECONDS = 3
 
@@ -124,6 +126,21 @@ def text_behind(page_id) -> bool:
     return PageTextBehind.objects.filter(page_id=page_id).exists()
 
 
+COPY_STALE_AFTER = timedelta(hours=1)  # a copy task that has not finished by then has failed
+
+
+def being_copied(page_id) -> bool:
+    """Whether Plane's copy task for a duplicated page is still to save the whole page (models.PageBeingCopied)."""
+    return PageBeingCopied.objects.filter(page_id=page_id, since__gt=timezone.now() - COPY_STALE_AFTER).exists()
+
+
+BEING_COPIED = (
+    409,
+    "page_not_ready",
+    "Halo is still finishing this page, a copy of another page. Try again in a moment.",
+)
+
+
 TEXT_BEHIND = (
     409,
     "page_text_behind",
@@ -144,6 +161,8 @@ def _check_size(html: str, binary) -> None:
 def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal, restore_from) -> dict:
     if text_behind(page.id):
         raise EditRefused(*TEXT_BEHIND)
+    if being_copied(page.id):
+        raise EditRefused(*BEING_COPIED)
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
     clean = new_body = new_json = None
@@ -170,6 +189,8 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         _check(page, expected_updated_at)
         if text_behind(page.id):
             raise EditRefused(*TEXT_BEHIND)
+        if being_copied(page.id):
+            raise EditRefused(*BEING_COPIED)
         if not page.description_binary:  # ensure_document gave it one; never edit a page without a document
             raise EditRefused(409, "page_not_ready", "Halo could not prepare this page for editing; try again.")
         old = {

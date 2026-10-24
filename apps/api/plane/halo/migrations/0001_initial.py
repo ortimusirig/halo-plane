@@ -19,4 +19,12 @@ class Migration(migrations.Migration):
             ],
             options={"db_table": "halo_page_text_behind"},
         ),
+        migrations.CreateModel(
+            name="PageBeingCopied",
+            fields=[
+                ("page_id", models.UUIDField(primary_key=True, serialize=False)),
+                ("since", models.DateTimeField()),
+            ],
+            options={"db_table": "halo_page_being_copied"},
+        ),
     ]

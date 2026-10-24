@@ -38,7 +38,7 @@ Halo. Only then switch the backend services to the image.
 
    | Route | Methods |
    | --- | --- |
-   | `pages/` | GET list (paginated, with page links), POST create (name, description_html, access) |
+   | `pages/` | GET list (paginated, with page links), POST create (name, description_html, access; not in archived projects) |
    | `pages/{page_id}/` | GET retrieve (HTML, plain text, link, embedded work items), PATCH name and/or text (replace, append or restore a version) |
    | `pages/{page_id}/archive/` | POST archive (refused while the page is open), DELETE unarchive; both refused for pages with sub-pages |
    | `pages/{page_id}/versions/`, `pages/{page_id}/versions/{version_id}/` | GET (plain text added) |
@@ -72,18 +72,24 @@ Halo. Only then switch the backend services to the image.
    received) is merged with it instead of overwriting it, and the missing part is sent to that editor through
    live. Such a save's HTML is that editor's older text, so the page is marked in Halo's own table
    (`halo_page_text_behind`, same transaction) until that editor's next, complete save: reads report
-   `text_complete: false`, API edits wait, and the merged save makes no page version. A page's first document
+   `text_complete: false`, API edits wait, and the merged save makes no page version. A save of the document
+   without its HTML marks the page the same way. A page's first document
    is built here from its HTML (live's converter) when it is first loaded, so live never converts on its own
    while an API edit writes the same page. The save itself mirrors Plane's code, with its background tasks
    started after commit. Plane's other web-app routes that save a whole page (properties, lock, access) run
    Plane's own code through a subclass (`HaloAppPageViewSet`) that locks the page's row before Plane reads it,
-   so none of them can write old text back over an API edit that committed in between.
+   so none of them can write old text back over an API edit that committed in between. Plane's page duplicate
+   runs through a subclass too (`HaloPageDuplicateEndpoint`, the same steps as Plane's): Plane's copy task
+   copies the page's images and then saves the whole page it read, so until it has run (Halo's
+   `finish_page_copy` runs it) the new page is marked in a second table (`halo_page_being_copied`). While
+   marked, API edits of it are refused (`page_not_ready`) and editors' loads wait up to 15 seconds; a mark older
+   than an hour (a worker that died) is ignored.
 
 4. Fix of Plane CE v1.4.2's page version history: `bgtasks/page_version_task.py` read `page.description`,
    which does not exist (`description_json` does), so no page version was ever written. The same task skips
    Halo's marked versions when it merges saves.
 
-Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with one table and its migration),
+Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with two tables and their migration),
 `apps/api/plane/settings/common.py` (the app in `INSTALLED_APPS`), `apps/api/plane/api/urls/__init__.py` and
 `apps/api/plane/urls.py` (includes), `apps/api/plane/bgtasks/page_version_task.py` (fix and marked versions),
 `apps/api/requirements/base.txt` (`pycrdt==0.14.8`), and this `halo/` folder (build, tests, upgrade gate).
@@ -91,7 +97,9 @@ Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with one table 
 Known limits: typing on an open page can be lost only where an API edit rewrote the same characters while
 live missed the half-second open-page probe. Pages over 100 kB of HTML (live's converter limit) cannot be
 edited through the API, and their first document is built by live itself, as in stock Plane. A marked page
-stays marked until an editor saves it again (any small change).
+stays marked until an editor saves it again (any small change). Plane's copy task saves the whole duplicated
+page it read, so a rename or property change of a new copy in its first seconds can be undone by it, as in
+stock Plane; Halo's API edits and editor loads wait for it.
 
 ## Build and test
 
@@ -106,7 +114,7 @@ bash halo/e2e/run.sh                       # end-to-end proof with Plane's real 
 `build-backend.sh` turns the committed diff from `PLANE_TAG` into `halo/patch/halo.patch`, and
 `Dockerfile.backend` applies it with `git apply` to the code inside `makeplane/plane-backend:v1.4.2`;
 a patch that no longer applies stops the build. The image replaces the `api`, `worker`, `beat-worker`
-and `migrator` images of a Plane deployment; run the migrator once (Halo's table, migration
+and `migrator` images of a Plane deployment; run the migrator once (Halo's two tables, migration
 `halo.0001_initial`; no change to Plane's tables). The live service
 stays the upstream image; the API reaches it at `HALO_LIVE_URL` (default `http://live:3000/live/`).
 
@@ -115,12 +123,15 @@ stays the upstream image; the API reaches it at `HALO_LIVE_URL` (default `http:/
 Halo runs one release behind Plane's newest and never downgrades. For a new Plane tag run
 `bash halo/upgrade-check.sh <tag>`, the release gate: it checks the patch against the new tag, builds the
 image on the new upstream image, runs the Halo tests and the end-to-end test with the new live image, and
-reports what needs a decision (the version bug fixed upstream, Plane's own API page routes, a moved
-description endpoint, a changed Hocuspocus or converter). `--check-only` gives the report without building;
+reports what needs a decision (the version bug fixed upstream, Plane's own API page routes, a changed
+description or duplicate endpoint, a changed Hocuspocus or converter). It passes only for a candidate branch
+built on the new tag whose `HALO_TAG` (in its `release.env`) is tagged on the candidate's commit, so the image
+and its published source are the same tree. `--check-only` gives the report without building;
 it is not a gate.
 
 ## Rollback
 
 Set the four backend services back to `makeplane/plane-backend:v1.4.2`. Page versions written by the
-patched build stay in `page_versions`; stock Plane reads them as normal versions. The table
-`halo_page_text_behind` stays and is unused by stock Plane (drop it only when Halo's patch is retired).
+patched build stay in `page_versions`; stock Plane reads them as normal versions. The tables
+`halo_page_text_behind` and `halo_page_being_copied` stay and are unused by stock Plane (drop them only when
+Halo's patch is retired).

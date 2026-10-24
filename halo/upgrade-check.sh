@@ -9,6 +9,12 @@
 # tag; then run the gate again with --candidate <that branch>. The candidate's patch is always its diff from its
 # own base.
 #
+# Only a candidate built on the new tag can pass: the image is the new upstream image with the patch, so its
+# published source (the HALO_TAG of the candidate's release.env) must be that same tree. The gate therefore needs
+# the candidate's release.env to name the new tag and a new HALO_TAG, and that tag to exist (locally) on the
+# candidate's commit; push the tag only after the gate passed. Running the deployed branch against a new tag is
+# still useful as a first look: the report then shows the candidate item OPEN.
+#
 # Halo runs one release behind Plane's newest and never downgrades: the new tag must be newer than the deployed
 # release (semantic order: v1.4.3-rc1 < v1.4.3). The gate checks the patch against the new tag, builds the image
 # on the new upstream image, runs the Halo tests, Plane's own tests (no new failures against the upstream image)
@@ -71,6 +77,20 @@ if [ "$candidate_base" != "$deployed" ] && [ "$candidate_base" != "$new" ]; then
   exit 1
 fi
 echo "deployed $deployed, new $new, candidate $candidate (based on $candidate_base)"
+open_items=0
+if [ "$candidate_base" = "$new" ]; then
+  echo "OK   candidate is built on $new"
+else
+  echo "OPEN candidate is built on $candidate_base: for a release, make a candidate branch on $new (see the header)"
+  open_items=$((open_items + 1))
+fi
+tag_commit=$(git rev-parse -q --verify "refs/tags/$HALO_TAG^{commit}" || true)
+if [ -n "$tag_commit" ] && [ "$tag_commit" = "$(git rev-parse "$candidate^{commit}")" ]; then
+  echo "OK   source tag $HALO_TAG is the candidate's commit"
+else
+  echo "OPEN source tag $HALO_TAG is missing or on another commit: tag the candidate (git tag $HALO_TAG) before the gate"
+  open_items=$((open_items + 1))
+fi
 
 git fetch -q --depth 1 origin "refs/tags/$new:refs/tags/$new"
 mkdir -p halo/patch
@@ -81,7 +101,6 @@ trap 'git worktree remove --force "$work"' EXIT
 git diff --binary "$candidate_base" "$candidate" -- apps/api > "$work/halo.patch"
 
 failures=0
-open_items=0
 if (cd "$work" && git apply --check halo.patch); then
   echo "OK   patch applies to $new"
 else
@@ -102,23 +121,29 @@ if grep -rlqE "pages" "$work/apps/api/plane/api/urls/"; then
 else
   echo "OK   Plane's API v1 still has no page routes"
 fi
-fingerprint=$("$py" -c '
+fingerprint() {  # <class name>: a short hash of each method of that class in Plane's page views
+  "$py" -c '
 import ast, hashlib, sys
-src = open(sys.argv[1], encoding="utf-8").read()
+src = open(sys.argv[1], encoding="utf-8").read().replace(chr(13) + chr(10), chr(10))
 for node in ast.walk(ast.parse(src)):
-    if isinstance(node, ast.ClassDef) and node.name == "PagesDescriptionViewSet":
+    if isinstance(node, ast.ClassDef) and node.name == sys.argv[2]:
         print(" ".join(item.name + "=" + hashlib.sha256(ast.get_source_segment(src, item).encode()).hexdigest()[:16]
                        for item in node.body if isinstance(item, ast.FunctionDef)))
-' "$work/apps/api/plane/app/views/page/base.py")
-if [ "$fingerprint" = "$UPSTREAM_DESCRIPTION_FINGERPRINT" ] \
-  && grep -q '"workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/description/"' \
-     "$work/apps/api/plane/app/urls/page.py"; then
-  echo "OK   Plane's description endpoint is unchanged (Halo's subclass mirrors it)"
-else
-  echo "OPEN Plane's description endpoint changed ($fingerprint): port the change to plane/halo/views.py"
-  echo "     HaloPagesDescriptionViewSet and update UPSTREAM_DESCRIPTION_FINGERPRINT"
-  open_items=$((open_items + 1))
-fi
+' "$work/apps/api/plane/app/views/page/base.py" "$1"
+}
+mirrored() {  # <class name> <expected fingerprint> <route suffix> <Halo class>: Halo's subclass copies that code
+  local found
+  found=$(fingerprint "$1")
+  if [ "$found" = "$2" ] \
+    && grep -qF "/pages/<uuid:page_id>/$3/" "$work/apps/api/plane/app/urls/page.py"; then
+    echo "OK   Plane's $1 is unchanged (Halo's $4 mirrors it)"
+  else
+    echo "OPEN Plane's $1 changed ($found): port the change to $4 in plane/halo/views.py and update release.env"
+    open_items=$((open_items + 1))
+  fi
+}
+mirrored PagesDescriptionViewSet "$UPSTREAM_DESCRIPTION_FINGERPRINT" description HaloPagesDescriptionViewSet
+mirrored PageDuplicateEndpoint "$UPSTREAM_DUPLICATE_FINGERPRINT" duplicate HaloPageDuplicateEndpoint
 hocuspocus=$(grep -E '"@hocuspocus/server"' "$work/pnpm-workspace.yaml" | tr -d ' "' || true)
 if [ "$hocuspocus" = "@hocuspocus/server:2.15.2" ]; then
   echo "OK   live uses Hocuspocus 2.15.2 (channel, messages and probe as tested)"

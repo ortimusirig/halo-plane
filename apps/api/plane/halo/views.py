@@ -12,11 +12,15 @@ endpoint for the web app and live, so a save from an editor that missed an API e
 
 import base64
 import json
+import time
 
 from django.conf import settings
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
-from django.db.models import Q
+from django.contrib.postgres.aggregates import ArrayAgg
+from django.contrib.postgres.fields import ArrayField
+from django.db.models import Q, UUIDField, Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
@@ -25,17 +29,17 @@ from plane.api.middleware.api_authentication import APIKeyAuthentication
 from plane.api.rate_limit import ApiKeyRateThrottle
 from plane.app.permissions import ROLE
 from plane.app.serializers import PageBinaryUpdateSerializer, PageDetailSerializer, PageSerializer
-from plane.app.views.page.base import PagesDescriptionViewSet, PageViewSet
+from plane.app.views.page.base import PageDuplicateEndpoint, PagesDescriptionViewSet, PageViewSet
 from plane.app.views.page.version import PageVersionEndpoint
 from plane.bgtasks.page_transaction_task import page_transaction
-from plane.db.models import Page, PageVersion, Project, ProjectMember
+from plane.db.models import Page, PageVersion, Project, ProjectMember, ProjectPage
 from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, ydoc
-from .edit import EditRefused, edit_page, ensure_document, sanitize, text_behind
-from .models import PageTextBehind
-from .tasks import track_page_version_after_save
+from .edit import EditRefused, being_copied, edit_page, ensure_document, sanitize, text_behind
+from .models import PageBeingCopied, PageTextBehind
+from .tasks import finish_page_copy, track_page_version_after_save
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -107,6 +111,10 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
                 "Halo's API creates a page from name, description_html and access only, not: " + ", ".join(unknown),
                 "unsupported_field",
             )
+        if not Project.objects.filter(pk=project_id, workspace__slug=slug, archived_at__isnull=True).exists():
+            # Plane's page list and reads leave archived projects out (PageViewSet.get_queryset); creating a page
+            # there would commit a page the answer could not show.
+            return _error("No such project, or it is archived.", "project_not_found", status.HTTP_404_NOT_FOUND)
         try:
             html = sanitize(request.data.get("description_html") or "<p></p>") or "<p></p>"
         except EditRefused as refused:
@@ -124,9 +132,11 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
         )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save()
-        page_transaction.delay(new_description_html=html, old_description_html=None, page_id=serializer.data["id"])
-        data = PageDetailSerializer(self.get_queryset().get(pk=serializer.data["id"])).data
+        with transaction.atomic():
+            # The page and its project link (PageSerializer.create) commit together, and only with the answer.
+            serializer.save()
+            data = PageDetailSerializer(self.get_queryset().get(pk=serializer.data["id"])).data
+        page_transaction.delay(new_description_html=html, old_description_html=None, page_id=data["id"])
         data["url"] = page_url(slug, project_id, data["id"])
         return Response(data, status=status.HTTP_201_CREATED)
 
@@ -259,6 +269,51 @@ class HaloAppPageViewSet(PageViewSet):
             return super().access(request, slug, project_id, page_id)
 
 
+class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
+    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps), except that Plane's copy task runs as
+    Halo's finish_page_copy while the new page is marked as being copied: that task saves the whole page it
+    read, so until it is done API edits are refused and editors' loads wait."""
+
+    def post(self, request, slug, project_id, page_id):
+        page = Page.objects.get(
+            pk=page_id, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
+        )
+        if page.access == Page.PRIVATE_ACCESS and page.owned_by_id != request.user.id:
+            return Response({"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN)
+        project_ids = ProjectPage.objects.filter(page_id=page_id).values_list("project_id", flat=True)
+        page.pk = None
+        page.name = f"{page.name} (Copy)"
+        page.description_binary = None
+        page.owned_by = request.user
+        page.created_by = request.user
+        page.updated_by = request.user
+        with transaction.atomic():
+            page.save()
+            for project_id in project_ids:
+                ProjectPage.objects.create(
+                    workspace_id=page.workspace_id,
+                    project_id=project_id,
+                    page_id=page.id,
+                    created_by_id=page.created_by_id,
+                    updated_by_id=page.updated_by_id,
+                )
+            PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
+        page_transaction.delay(new_description_html=page.description_html, old_description_html=None, page_id=page.id)
+        # Plane passes the last project of the loop to its copy task; so does Halo.
+        finish_page_copy.delay(page_id=page.id, project_id=project_id, slug=slug, user_id=request.user.id)
+        page = (
+            Page.objects.filter(pk=page.id)
+            .annotate(
+                project_ids=Coalesce(
+                    ArrayAgg("projects__id", distinct=True, filter=~Q(projects__id=True)),
+                    Value([], output_field=ArrayField(UUIDField())),
+                )
+            )
+            .first()
+        )
+        return Response(PageDetailSerializer(page).data, status=status.HTTP_201_CREATED)
+
+
 class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
     """Plane's description endpoint: the live editor loads and saves pages through it, signed in as the person.
 
@@ -284,6 +339,12 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
         if not lease.wait_until_free(page_id):
             return _error("An edit of this page is still running; reload the page in a moment.",
                           "edit_in_progress", status.HTTP_503_SERVICE_UNAVAILABLE)
+        deadline = time.monotonic() + lease.WAIT_SECONDS
+        while being_copied(page_id):
+            if time.monotonic() >= deadline:
+                return _error("Halo is still finishing this copied page; reload it in a moment.",
+                              "page_not_ready", status.HTTP_503_SERVICE_UNAVAILABLE)
+            time.sleep(0.2)
         page = self._visible_page(request, slug, project_id, page_id)
         if page is not None and not page.description_binary:
             try:
@@ -327,11 +388,11 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             if not serializer.is_valid():
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             serializer.save()
-            if merged:
-                # The saved HTML is that editor's older text: marked until its next, complete save.
+            if merged or (encoded and not data.get("description_html")):
+                # The saved HTML is older than the document (a merged save, or a save without HTML): marked
+                # until a complete save, of both the whole document and its HTML.
                 PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
-            elif encoded and data.get("description_html"):
-                # Only a save of both the whole document and its HTML is complete.
+            elif encoded:
                 PageTextBehind.objects.filter(page_id=page.pk).delete()
             if data.get("description_html"):
                 new_html = data["description_html"]
