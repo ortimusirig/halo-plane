@@ -20,19 +20,35 @@ export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 # shellcheck source=release.env
 . halo/release.env
-deployed=$PLANE_TAG
+# The release Halo runs: this checkout's base, or the deployed branch's when this run is inside a candidate.
+deployed=${HALO_DEPLOYED_TAG:-$PLANE_TAG}
 
 new=${1:?give the new Plane tag, for example v1.4.3}
 shift
 candidate=HEAD
 mode=gate
+mode_flag=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --candidate) candidate=${2:?give the candidate branch}; shift 2 ;;
-    --check-only) mode=check; shift ;;
+    --check-only) mode=check; mode_flag=(--check-only); shift ;;
     *) echo "unknown argument: $1"; exit 2 ;;
   esac
 done
+
+if [ "$candidate" != HEAD ]; then
+  # Everything a release is built and tested with (patch, Dockerfile, pins, fingerprints, tests) comes from the
+  # candidate itself: run this gate again from a checkout of it, keeping the deployed release for the
+  # no-downgrade check.
+  inside="$(pwd -W 2>/dev/null || pwd)/halo/patch/candidate-$$"
+  git worktree add -q --detach "$inside" "$candidate"
+  trap 'git worktree remove --force "$inside"' EXIT
+  set +e
+  HALO_DEPLOYED_TAG="$deployed" bash "$inside/halo/upgrade-check.sh" "$new" "${mode_flag[@]}"
+  status=$?
+  set -e
+  exit "$status"
+fi
 
 py=$(command -v python3 || command -v python)
 newer=$("$py" -c '
@@ -133,18 +149,32 @@ docker build -q -f halo/Dockerfile.backend --build-arg PLANE_IMAGE="makeplane/pl
   --build-arg HALO_REVISION="$(git rev-parse "$candidate")" -t "$image" halo >/dev/null
 echo "OK   built $image"
 HALO_BACKEND_IMAGE="$image" bash halo/test-backend.sh plane/halo/tests -q
-# Plane's own tests: the patched image may not add a failure to those of the upstream image.
-listing() { grep -E "^(FAILED|ERROR) plane/" | sed 's/ - .*//' | sort; }
-HALO_UPSTREAM_IMAGE="makeplane/plane-backend:$new" bash halo/test-backend.sh --upstream plane/tests -q \
-  2>&1 | listing > halo/patch/upstream-failures.txt || true
-HALO_BACKEND_IMAGE="$image" bash halo/test-backend.sh plane/tests -q 2>&1 | listing > halo/patch/halo-failures.txt || true
-added=$(comm -13 halo/patch/upstream-failures.txt halo/patch/halo-failures.txt)
+# Plane's own tests: the patched image may not add a failure to those of the upstream image. A run counts only
+# when pytest ran the tests: exit code 0 (all passed) or 1 (some failed) and a results line; 2 to 5 (interrupted,
+# internal error, usage error, nothing collected) or a missing results line stop the gate.
+plane_tests() {  # <log file> <test-backend.sh arguments...>
+  local log=$1
+  shift
+  set +e
+  bash halo/test-backend.sh "$@" plane/tests -q > "$log" 2>&1
+  local code=$?
+  set -e
+  if [ "$code" -gt 1 ] || ! grep -qE "[0-9]+ (passed|failed)" "$log"; then
+    echo "FAIL Plane's tests did not run (pytest exit $code, $log):"
+    tail -5 "$log"
+    exit 1
+  fi
+  grep -E "^(FAILED|ERROR) plane/" "$log" | sed 's/ - .*//' | sort > "$log.failures" || true
+}
+HALO_UPSTREAM_IMAGE="makeplane/plane-backend:$new" plane_tests halo/patch/upstream-tests.log --upstream
+HALO_BACKEND_IMAGE="$image" plane_tests halo/patch/halo-tests.log
+added=$(comm -13 halo/patch/upstream-tests.log.failures halo/patch/halo-tests.log.failures)
 if [ -n "$added" ]; then
   echo "FAIL Plane tests that fail only with Halo's patch:"
   echo "$added"
   exit 1
 fi
-echo "OK   Plane's own tests: no failure beyond the upstream image's $(wc -l < halo/patch/upstream-failures.txt)"
+echo "OK   Plane's own tests: no failure beyond the upstream image's $(wc -l < halo/patch/upstream-tests.log.failures)"
 HALO_BACKEND_IMAGE="$image" PLANE_LIVE_IMAGE="makeplane/plane-live:$new" bash halo/e2e/run.sh
 if [ "$open_items" != 0 ]; then
   echo "GATE OPEN: tests pass, but $open_items compatibility item(s) above need a decision"

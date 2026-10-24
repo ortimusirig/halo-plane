@@ -33,7 +33,7 @@ from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, ydoc
-from .edit import EditRefused, edit_page, sanitize
+from .edit import EditRefused, edit_page, sanitize, text_in_sync
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -93,7 +93,7 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
                     "description_text": page.description_stripped or "",
                     "url": page_url(slug, project_id, page_id),
                     # False while the stored HTML lags an editor's merged save (API edits wait for it).
-                    "text_complete": not lease.text_behind(page_id),
+                    "text_complete": text_in_sync(page.description_html, page.description_binary),
                 }
             )
         return response
@@ -148,6 +148,9 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
         page = Page.objects.get(
             pk=page_id, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
         )
+        if page.parent_id:
+            # Plane's page views leave sub-pages out (PageViewSet.get_queryset); so does this API.
+            return _error("This page is a sub-page; edit it in Halo.", "page_hierarchy")
         restore_from = None
         if restore_id is not None:
             restore_from = PageVersion.objects.filter(pk=restore_id, page_id=page.id).first()
@@ -247,9 +250,10 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
         if page is not None and not page.description_binary:
             try:
                 self._build_first_document(page.pk)
-            except live.LiveUnavailable:
-                return _error("Halo's editor service could not prepare the page; reload it in a moment.",
-                              "live_unavailable", status.HTTP_503_SERVICE_UNAVAILABLE)
+            except live.LiveUnavailable as error:
+                # Too large for live's converter (or not reachable): live then converts the page itself, as
+                # in stock Plane. An API edit cannot race it: an edit of this page needs the same converter.
+                log_exception(error)
         return super().retrieve(request, slug, project_id, page_id)
 
     @staticmethod
@@ -292,16 +296,16 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             if not serializer.is_valid():
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             serializer.save()
-            if encoded:
-                # A merged save's HTML is the editor's older text; the next complete save brings it up to date.
-                (lease.mark_text_behind if merged else lease.clear_text_behind)(page.pk)
             if data.get("description_html"):
                 new_html = data["description_html"]
                 transaction.on_commit(lambda: page_transaction.delay(
                     new_description_html=new_html, old_description_html=old_description_html, page_id=page_id))
-            user_id = request.user.id
-            transaction.on_commit(lambda: track_page_version.delay(
-                page_id=page_id, existing_instance=existing_instance, user_id=user_id))
+            if not merged:
+                # A merged save's HTML is that editor's older text, so it makes no version; the editor's next
+                # save, complete because it received the missing part, does.
+                user_id = request.user.id
+                transaction.on_commit(lambda: track_page_version.delay(
+                    page_id=page_id, existing_instance=existing_instance, user_id=user_id))
         if missing:
             try:
                 live.publish_update(page_id, missing)

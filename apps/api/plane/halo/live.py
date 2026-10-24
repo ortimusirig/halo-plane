@@ -33,6 +33,10 @@ class LiveUnavailable(Exception):
     pass
 
 
+class LiveTooLarge(LiveUnavailable):
+    """Live refused the HTML as too large (its request limit is express.json's default, 100 kB)."""
+
+
 def convert_html(html: str) -> tuple[bytes, dict]:
     """Live's conversion of HTML into the page editor's Yjs document and ProseMirror JSON."""
     try:
@@ -43,6 +47,8 @@ def convert_html(html: str) -> tuple[bytes, dict]:
         )
     except requests.RequestException as error:
         raise LiveUnavailable(str(error)) from error
+    if reply.status_code == 413:
+        raise LiveTooLarge("the page is larger than live's converter accepts (100 kB of HTML)")
     if reply.status_code != 200:
         raise LiveUnavailable(f"live converter answered HTTP {reply.status_code}")
     data = reply.json()

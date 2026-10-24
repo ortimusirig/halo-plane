@@ -33,6 +33,9 @@ PROTECTED_PARTS = {
 }
 
 
+DIFF_LIMIT = 250_000  # pairs one diff may compare; past it the changed middle is rewritten as one run
+
+
 class DocumentEdit(NamedTuple):
     state: bytes  # the whole document after the change
     update: bytes  # only the change, for copies that already hold the old document
@@ -86,6 +89,27 @@ def _insert_node(parent, index: int, node) -> None:
         _fill(parent.children.insert(index, XmlElement(node.tag, dict(node.attributes))), node)
 
 
+def _changes(old: list, new: list) -> list[tuple[int, int, int, int]]:
+    """Changed ranges (old_start, old_end, new_start, new_end), after trimming the common start and end."""
+    start = 0
+    while start < min(len(old), len(new)) and old[start] == new[start]:
+        start += 1
+    end = 0
+    while end < min(len(old), len(new)) - start and old[len(old) - 1 - end] == new[len(new) - 1 - end]:
+        end += 1
+    old_middle, new_middle = old[start : len(old) - end], new[start : len(new) - end]
+    if not old_middle and not new_middle:
+        return []
+    if len(old_middle) * len(new_middle) > DIFF_LIMIT:  # SequenceMatcher is quadratic on repetitive input
+        return [(start, len(old) - end, start, len(new) - end)]
+    matcher = difflib.SequenceMatcher(None, old_middle, new_middle, autojunk=False)
+    return [
+        (start + old_start, start + old_end, start + new_start, start + new_end)
+        for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes()
+        if operation != "equal"
+    ]
+
+
 def _units(text: XmlText):
     """The text as (character, formatting) pairs; None when it holds embeds."""
     units = []
@@ -112,11 +136,8 @@ def _patch_text(text: XmlText, new: XmlText) -> bool:
     if old_units == new_units:
         return False
     old_string = "".join(character for character, _ in old_units)
-    matcher = difflib.SequenceMatcher(None, old_units, new_units, autojunk=False)
     # pycrdt counts text positions in UTF-8 bytes; from the end backwards, earlier positions stay valid.
-    for operation, old_start, old_end, new_start, new_end in reversed(matcher.get_opcodes()):
-        if operation == "equal":
-            continue
+    for old_start, old_end, new_start, new_end in reversed(_changes(old_units, new_units)):
         start = len(old_string[:old_start].encode("utf-8"))
         end = len(old_string[:old_end].encode("utf-8"))
         if end > start:
@@ -153,13 +174,9 @@ def _same_kind(node, new) -> bool:
 def _patch_children(parent, new_parent) -> bool:
     """Lay new_parent's children over parent's: keep equal nodes, edit paired nodes in place, add the rest."""
     old, new = list(parent.children), list(new_parent.children)
-    matcher = difflib.SequenceMatcher(None, [_signature(n) for n in old], [_signature(n) for n in new], autojunk=False)
-    changed = False
+    changes = _changes([_signature(n) for n in old], [_signature(n) for n in new])
     # From the end backwards, so the indexes of earlier nodes stay valid.
-    for operation, old_start, old_end, new_start, new_end in reversed(matcher.get_opcodes()):
-        if operation == "equal":
-            continue
-        changed = True
+    for old_start, old_end, new_start, new_end in reversed(changes):
         paired = min(old_end - old_start, new_end - new_start)
         for index in range(old_end - 1, old_start + paired - 1, -1):
             del parent.children[index]
@@ -174,7 +191,7 @@ def _patch_children(parent, new_parent) -> bool:
                 _patch_text(node, replacement)
             else:
                 _patch_element(node, replacement)
-    return changed
+    return bool(changes)
 
 
 def _replace_blocks(body: XmlFragment, new_body: XmlFragment) -> bool:
@@ -216,6 +233,22 @@ def edit_document(
         if name is not None:
             changed |= _set_title(doc.get(TITLE, type=XmlFragment), name)
     return DocumentEdit(doc.get_update(), doc.get_update(before) if changed else b"", changed)
+
+
+def body_text(binary: bytes) -> str:
+    """All the text in the body, without formatting (to compare with the stored HTML's text)."""
+    parts = []
+
+    def walk(node):
+        for child in node.children:
+            if isinstance(child, XmlText):
+                parts.extend(chunk for chunk, _ in child.diff() if isinstance(chunk, str))
+            else:
+                walk(child)
+
+    if binary:
+        walk(_load(binary).get(BODY, type=XmlFragment))
+    return "".join(parts)
 
 
 def protected_parts(binary: bytes) -> Counter:

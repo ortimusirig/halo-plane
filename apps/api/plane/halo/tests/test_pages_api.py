@@ -252,7 +252,8 @@ def _description_url(world):
     return f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{world.public.id}/description/"
 
 
-def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_client):
+def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_client,
+                                                       django_capture_on_commit_callbacks):
     """The live editor saves the whole document; a save from before an API edit must not undo it."""
     stale = Doc()
     stale.apply_update(bytes(world.public.description_binary))
@@ -267,7 +268,8 @@ def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_cli
     assert edited.status_code == 200
     api_client.force_authenticate(user=world.owner.user)  # the web app's and live's session sign-in
     published = []
-    with patch("plane.halo.live.publish_update", side_effect=lambda page_id, update: published.append(update) or 1):
+    with patch("plane.halo.live.publish_update", side_effect=lambda page_id, update: published.append(update) or 1), \
+            django_capture_on_commit_callbacks(execute=False) as callbacks:
         response = api_client.patch(
             _description_url(world),
             {
@@ -277,6 +279,7 @@ def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_cli
             format="json",
         )
     assert response.status_code == 200, response.content
+    assert len(callbacks) == 1  # page_transaction only: a merged save makes no version (its HTML is older)
     saved = Doc()
     saved.apply_update(bytes(Page.objects.get(pk=world.public.pk).description_binary))
     assert str(saved.get(ydoc.BODY, type=XmlFragment)) == (
@@ -298,6 +301,29 @@ def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_cli
         "description_html": "<p>Alpha typed!</p><p>Beta by AURA</p><p>Gamma</p>"}, format="json")
     assert complete.status_code == 200
     assert world.owner.client.get(url).json()["text_complete"] is True
+
+
+def test_sub_page_edits_are_refused_before_anything_changes(world, fake_live):
+    child = world.make_page(world.owner, "Child", "<p>c</p>")
+    Page.objects.filter(pk=child.pk).update(parent=world.public)
+    url = f"{world.base}{child.id}/"
+    response = world.owner.client.patch(
+        url, {"description_html": "<p>new</p>", "expected_updated_at": child.updated_at.isoformat()}, format="json"
+    )
+    assert (response.status_code, response.json()["code"]) == (400, "page_hierarchy")
+    assert Page.objects.get(pk=child.pk).description_html == "<p>c</p>"
+    assert not PageVersion.objects.filter(page=child).exists()
+
+
+def test_first_load_of_a_page_too_large_for_the_converter_is_left_to_live(world, fake_live, api_client):
+    page = world.make_page(world.owner, "Big", "<p>big</p>", binary=False)
+    fake_live.too_large = True
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
+    response = api_client.get(url)
+    assert response.status_code == 200 and b"".join(response.streaming_content) == b""
+    page.refresh_from_db()
+    assert page.description_binary is None  # live converts it itself, as in stock Plane
 
 
 def test_editor_save_starts_version_tasks_only_after_commit(world, api_client, no_celery,

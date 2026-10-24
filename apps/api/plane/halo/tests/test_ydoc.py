@@ -230,3 +230,21 @@ def test_missing_from_catches_a_pure_deletion():
     stored = ydoc.edit_document(base, new_body=page(p("Alpha"))).state
     union, _ = ydoc.missing_from(base, stored)
     assert text_of(union) == "<paragraph>Alpha</paragraph>"
+
+
+def test_long_repetitive_text_is_diffed_quickly_and_correctly():
+    import time
+
+    long = "a" * 20000
+    old = page(p(long))
+    for new_text in (long[:10000] + "b" + long[10000:], "ab" * 5000 + "c" + "ba" * 5000):
+        started = time.monotonic()
+        edit = ydoc.edit_document(old, new_body=page(p(new_text)))
+        assert time.monotonic() - started < 3
+        assert ydoc.body_text(edit.state) == new_text
+
+
+def test_body_text_joins_all_text_without_formatting():
+    binary = page(("heading", {"level": 2.0}, [("Plan ", None), ("now", {"bold": {}})]), p("café"))
+    assert ydoc.body_text(binary) == "Plan nowcafé"
+    assert ydoc.body_text(b"") == ""

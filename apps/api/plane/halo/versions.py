@@ -35,13 +35,8 @@ def _version(page, user_id, saved_at, html, binary, json_data):
 def record_edit(page, user_id, old: dict):
     """Write the before and after versions of an edit already saved on page."""
     now = timezone.now()
-    newest = PageVersion.objects.filter(page_id=page.id).order_by("-last_saved_at").first()
-    if newest is not None and newest.description_html == old["description_html"]:
-        before = newest
-    else:
-        before = _version(
-            page, user_id, now, old["description_html"], old["description_binary"], old["description_json"]
-        )
+    # Always a new, marked version: an existing unmarked one could still be rewritten by Plane's version task.
+    before = _version(page, user_id, now, old["description_html"], old["description_binary"], old["description_json"])
     after = _version(
         page,
         user_id,

@@ -11,6 +11,8 @@ document (ydoc). The update is published on live's channel after commit, and aga
 editor that opened the page in that moment still receives it.
 """
 
+import html as html_entities
+import re
 import threading
 
 from django.db import transaction
@@ -20,6 +22,7 @@ from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page
 from plane.utils.content_validator import validate_binary_data, validate_html_content
 from plane.utils.exception_logger import log_exception
+from plane.utils.html_processor import strip_tags
 
 from . import lease, live, versions, ydoc
 
@@ -58,6 +61,15 @@ def _check(page: Page, expected_updated_at) -> None:
         raise EditRefused(409, "page_changed", "The page changed since it was read; read it again first.")
 
 
+def _convert(html: str):
+    try:
+        return live.convert_html(html)
+    except live.LiveTooLarge:
+        raise EditRefused(413, "page_too_large_for_editor",
+                          "This page is too large for Halo's editor service to convert (100 kB of HTML); "
+                          "edit it in Halo.")
+
+
 def _publish(page_id, update: bytes):
     try:
         return live.publish_update(page_id, update)
@@ -91,6 +103,28 @@ def edit_page(
         raise EditRefused(409, "edit_in_progress", "Another edit of this page is in progress; try again shortly.")
 
 
+def text_in_sync(html: str, binary) -> bool:
+    """Whether the stored HTML says what the document says (it lags after a merged editor save until that
+    editor saves again). Compares the text only, without whitespace; a page without a document is in sync."""
+    if not binary:
+        return True
+    # The editor's emoji node holds only its name in the document but renders its character in the HTML.
+    html = EMOJI_SPAN.sub("", html or "")
+    squash = lambda text: re.sub(r"\s+", "", text)
+    return squash(html_entities.unescape(strip_tags(html))) == squash(ydoc.body_text(bytes(binary)))
+
+
+EMOJI_SPAN = re.compile(r'<span\b[^>]*\bdata-type="emoji"[^>]*>.*?</span>', re.S)
+
+
+TEXT_BEHIND = (
+    409,
+    "page_text_behind",
+    "Halo is still taking in the latest text of this page from someone's editor. Ask them to make any small "
+    "change in the page (or wait until they do), then read the page again.",
+)
+
+
 def _check_size(html: str, binary) -> None:
     """Plane's own limits for a saved page (content_validator), on the whole page after the edit."""
     valid, error, _ = validate_html_content(html)
@@ -101,12 +135,8 @@ def _check_size(html: str, binary) -> None:
 
 
 def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal, restore_from) -> dict:
-    if lease.text_behind(page.id):
-        raise EditRefused(
-            409, "page_text_behind",
-            "Halo is still taking in the latest text of this page from someone's editor. Ask them to make any "
-            "small change in the page (or wait until they do), then read the page again.",
-        )
+    if not text_in_sync(page.description_html, page.description_binary):
+        raise EditRefused(*TEXT_BEHIND)
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
     clean = new_body = new_json = None
@@ -117,15 +147,17 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         if restore_from.description_binary:
             new_body = bytes(restore_from.description_binary)
         else:
-            new_body = live.convert_html(clean)[0]
+            new_body = _convert(clean)[0]
         html, append, allow_removal = clean, False, True  # an undo may remove what came after the version
     elif html is not None:
         clean = sanitize(html) or "<p></p>"
-        new_body, new_json = live.convert_html(clean)
+        new_body, new_json = _convert(clean)
 
     with transaction.atomic():
         page = Page.objects.select_for_update().get(pk=page.pk)
         _check(page, expected_updated_at)
+        if not text_in_sync(page.description_html, page.description_binary):
+            raise EditRefused(*TEXT_BEHIND)
         old = {
             "description_html": page.description_html,
             "description_binary": page.description_binary,
@@ -145,7 +177,7 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         else:
             # Nobody has opened the page yet, so there is no document: live builds it from the HTML on first open.
             body_changed = html is not None and full_html != old["description_html"]
-            before_body = live.convert_html(old["description_html"])[0] if body_changed and not append else None
+            before_body = _convert(old["description_html"])[0] if body_changed and not append else None
             after_body = new_body
         if body_changed and not append and not allow_removal:
             lost = ydoc.removed_parts(before_body, after_body)

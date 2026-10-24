@@ -33,7 +33,8 @@ def test_edit_keeps_old_content_before_and_new_content_after(world):
 
 
 @pytest.mark.django_db
-def test_newest_version_with_the_old_content_is_reused(world):
+def test_before_is_always_a_new_marked_version(world):
+    """An existing unmarked version could still be rewritten by Plane's version task, so it is never reused."""
     page = world.public
     kept = PageVersion.objects.create(
         page=page,
@@ -46,8 +47,8 @@ def test_newest_version_with_the_old_content_is_reused(world):
     page.description_html = "<p>Changed</p>"
     page.save()
     before, after = versions.record_edit(page, world.owner.user.id, old)
-    assert before.id == kept.id
-    assert PageVersion.objects.filter(page=page).count() == 2
+    assert before.id != kept.id and before.sub_pages_data == {"halo_api_edit": True}
+    assert PageVersion.objects.filter(page=page).count() == 3
 
 
 @pytest.mark.django_db

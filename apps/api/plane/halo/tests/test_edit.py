@@ -193,15 +193,34 @@ def test_api_versions_are_marked(world, fake_live):
 
 
 @pytest.mark.django_db
-def test_edit_waits_while_the_stored_html_lags_an_editor(world, fake_live):
-    from plane.halo import lease
-
-    lease.mark_text_behind(world.public.id)
+def test_edit_waits_while_the_stored_html_lags_the_document(world, fake_live):
+    # As after a merged editor save: the document has text that the stored HTML does not.
+    Page.objects.filter(pk=world.public.pk).update(description_html="<p>Alpha</p><p>Beta</p>")
     with pytest.raises(edit.EditRefused) as refused:
         _edit(world, html="<p>Other</p>")
     assert (refused.value.status, refused.value.code) == (409, "page_text_behind")
-    lease.clear_text_behind(world.public.id)
+    Page.objects.filter(pk=world.public.pk).update(description_html=ORIGINAL)  # the editor's complete save
     assert _edit(world, html="<p>Other</p>")["changed"]
+
+
+def test_text_in_sync_ignores_markup_whitespace_and_entities():
+    from plane.halo.tests.conftest import doc_for
+
+    binary = doc_for(["Fish & chips", "Tea"])
+    assert edit.text_in_sync('<p class="x">Fish &amp; chips</p>\n<p> Tea </p>', binary)
+    assert not edit.text_in_sync("<p>Fish &amp; chips</p>", binary)
+    assert edit.text_in_sync("<p>anything</p>", None)
+    # An emoji node holds no text in the document but renders its character in the HTML.
+    assert edit.text_in_sync('<p>Fish &amp; <span data-type="emoji" data-name="fish">X</span>chips</p><p>Tea</p>',
+                             binary)
+
+
+@pytest.mark.django_db
+def test_page_too_large_for_the_converter_is_refused(world, fake_live):
+    fake_live.too_large = True
+    with pytest.raises(edit.EditRefused) as refused:
+        _edit(world, html="<p>Other</p>")
+    assert (refused.value.status, refused.value.code) == (413, "page_too_large_for_editor")
 
 
 @pytest.mark.django_db

@@ -89,15 +89,17 @@ def clean_redis():
 
 @pytest.fixture
 def fake_live():
-    """Replace live's converter; a test sets .down = True to make it fail."""
-    from plane.halo.live import LiveUnavailable
+    """Replace live's converter; a test sets .down or .too_large to make it fail."""
+    from plane.halo.live import LiveTooLarge, LiveUnavailable
 
-    state = SimpleNamespace(down=False, calls=[])
+    state = SimpleNamespace(down=False, too_large=False, calls=[])
 
     def convert(html):
         state.calls.append(html)
         if state.down:
             raise LiveUnavailable("live is down")
+        if state.too_large:
+            raise LiveTooLarge("over 100 kB")
         return doc_for(paragraphs(html)), {"type": "doc"}
 
     with patch("plane.halo.live.convert_html", side_effect=convert):

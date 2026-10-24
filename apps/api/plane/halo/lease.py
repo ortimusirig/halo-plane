@@ -2,13 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
-"""Coordination between API edits and the editors that load and save a page (Redis keys per page).
-
-- An edit lease: one API edit of a page at a time; an editor's load waits for it, and fails rather than load
-  a page an edit is still writing.
-- A "text behind" mark: set when an editor's save had to be merged with an API edit it never received; the
-  stored HTML then lags the document until that editor saves again, and API edits wait for that.
-"""
+"""One API edit of a page at a time, and editors that load the page wait for it (a Redis key per page); a load
+fails rather than read a page an edit is still writing."""
 
 import time
 import uuid
@@ -16,9 +11,8 @@ from contextlib import contextmanager
 
 from plane.settings.redis import redis_instance
 
-LEASE_SECONDS = 30  # longest an edit may hold a page; a crashed edit frees it after this
+LEASE_SECONDS = 60  # longer than any edit (two 10 s conversions at most); a crashed edit frees it after this
 WAIT_SECONDS = 15  # longest an editor's load waits for an edit (live gives up on the API after 20 s)
-TEXT_BEHIND_SECONDS = 7 * 24 * 3600
 
 
 class PageBusy(Exception):
@@ -27,10 +21,6 @@ class PageBusy(Exception):
 
 def key(page_id) -> str:
     return f"halo:page-edit:{page_id}"
-
-
-def text_behind_key(page_id) -> str:
-    return f"halo:text-behind:{page_id}"
 
 
 @contextmanager
@@ -58,15 +48,3 @@ def wait_until_free(page_id, seconds: float | None = None) -> bool:
             return False
         time.sleep(0.1)
     return True
-
-
-def mark_text_behind(page_id) -> None:
-    redis_instance().set(text_behind_key(page_id), "1", ex=TEXT_BEHIND_SECONDS)
-
-
-def clear_text_behind(page_id) -> None:
-    redis_instance().delete(text_behind_key(page_id))
-
-
-def text_behind(page_id) -> bool:
-    return bool(redis_instance().exists(text_behind_key(page_id)))
