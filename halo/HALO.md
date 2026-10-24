@@ -75,7 +75,9 @@ Halo. Only then switch the backend services to the image.
    `text_complete: false`, API edits wait, and the merged save makes no page version. A page's first document
    is built here from its HTML (live's converter) when it is first loaded, so live never converts on its own
    while an API edit writes the same page. The save itself mirrors Plane's code, with its background tasks
-   started after commit.
+   started after commit. Plane's other web-app routes that save a whole page (properties, lock, access) run
+   Plane's own code through a subclass (`HaloAppPageViewSet`) that locks the page's row before Plane reads it,
+   so none of them can write old text back over an API edit that committed in between.
 
 4. Fix of Plane CE v1.4.2's page version history: `bgtasks/page_version_task.py` read `page.description`,
    which does not exist (`description_json` does), so no page version was ever written. The same task skips
