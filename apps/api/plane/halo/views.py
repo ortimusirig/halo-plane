@@ -11,20 +11,25 @@ endpoint for the web app and live, so a save from an editor that missed an API e
 """
 
 import base64
+import json
 
 from django.conf import settings
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.response import Response
 
 from plane.api.middleware.api_authentication import APIKeyAuthentication
 from plane.api.rate_limit import ApiKeyRateThrottle
 from plane.app.permissions import ROLE
-from plane.app.serializers import PageDetailSerializer, PageSerializer
+from plane.app.serializers import PageBinaryUpdateSerializer, PageDetailSerializer, PageSerializer
 from plane.app.views.page.base import PagesDescriptionViewSet, PageViewSet
 from plane.app.views.page.version import PageVersionEndpoint
 from plane.bgtasks.page_transaction_task import page_transaction
+from plane.bgtasks.page_version_task import track_page_version
 from plane.db.models import Page, PageVersion, Project, ProjectMember
+from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, ydoc
@@ -84,7 +89,12 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
             page = Page.objects.get(pk=page_id)
             response.data["work_item_ids"] = [str(item) for item in response.data.pop("issue_ids", [])]
             response.data.update(
-                {"description_text": page.description_stripped or "", "url": page_url(slug, project_id, page_id)}
+                {
+                    "description_text": page.description_stripped or "",
+                    "url": page_url(slug, project_id, page_id),
+                    # False while the stored HTML lags an editor's merged save (API edits wait for it).
+                    "text_complete": not lease.text_behind(page_id),
+                }
             )
         return response
 
@@ -185,40 +195,92 @@ class HaloPageVersionEndpoint(PersonalTokenMixin, PageVersionEndpoint):
 
 
 class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
-    """Plane's description endpoint (the live editor loads and saves pages through it, signed in as the person).
+    """Plane's description endpoint: the live editor loads and saves pages through it, signed in as the person.
 
-    Loading waits while an API edit of the page is running. A save that lacks part of the stored document (an
-    API edit that editor never received) is merged with it, so nothing is lost, and the missing part is sent to
-    that editor through live. Every other request is Plane's own code.
+    Loading waits while an API edit of the page runs, and fails rather than load a page an edit is still
+    writing. A page that has no document yet gets one here, built from its HTML by live's converter, so the
+    first editor never converts on its own while an API edit writes the same page. Saving is Plane's
+    PagesDescriptionViewSet.partial_update (same checks, serializer and tasks) under a row lock, with two
+    changes: a save that lacks part of the stored document (an API edit that editor never received) is merged
+    with it instead of overwriting it, and the background tasks start only after the save is committed.
     """
 
+    def _visible_page(self, request, slug, project_id, page_id):
+        # Plane's lookup in PagesDescriptionViewSet: the person's own pages and public pages of the project.
+        return Page.objects.filter(
+            Q(owned_by=request.user) | Q(access=0),
+            pk=page_id,
+            workspace__slug=slug,
+            projects__id=project_id,
+            project_pages__deleted_at__isnull=True,
+        ).first()
+
     def retrieve(self, request, slug, project_id, page_id):
-        lease.wait_until_free(page_id)
+        if not lease.wait_until_free(page_id):
+            return _error("An edit of this page is still running; reload the page in a moment.",
+                          "edit_in_progress", status.HTTP_503_SERVICE_UNAVAILABLE)
+        page = self._visible_page(request, slug, project_id, page_id)
+        if page is not None and not page.description_binary:
+            try:
+                self._build_first_document(page.pk)
+            except live.LiveUnavailable:
+                return _error("Halo's editor service could not prepare the page; reload it in a moment.",
+                              "live_unavailable", status.HTTP_503_SERVICE_UNAVAILABLE)
         return super().retrieve(request, slug, project_id, page_id)
 
+    @staticmethod
+    def _build_first_document(page_pk):
+        with transaction.atomic():
+            page = Page.objects.select_for_update().get(pk=page_pk)
+            if page.description_binary:
+                return
+            binary, json_data = live.convert_html(page.description_html or "<p></p>")
+            # update(), not save(): building the document is not a change, so updated_at stays.
+            Page.objects.filter(pk=page_pk).update(description_binary=binary, description_json=json_data)
+
     def partial_update(self, request, slug, project_id, page_id):
-        encoded = request.data.get("description_binary")
-        if not encoded:
-            return super().partial_update(request, slug, project_id, page_id)
+        found = self._visible_page(request, slug, project_id, page_id)
+        if found is None:
+            raise Page.DoesNotExist
         missing = None
         with transaction.atomic():
-            stored = Page.objects.select_for_update().filter(pk=page_id).values_list("description_binary", flat=True)
-            stored = stored.first()
-            if stored:
+            page = Page.objects.select_for_update().get(pk=found.pk)
+            if page.is_locked:
+                return Response({"error_code": ERROR_CODES["PAGE_LOCKED"], "error_message": "PAGE_LOCKED"},
+                                status=status.HTTP_400_BAD_REQUEST)
+            if page.archived_at:
+                return Response({"error_code": ERROR_CODES["PAGE_ARCHIVED"], "error_message": "PAGE_ARCHIVED"},
+                                status=status.HTTP_400_BAD_REQUEST)
+            data = dict(request.data.items())
+            encoded = data.get("description_binary")
+            merged = None
+            if encoded and page.description_binary:
                 try:
-                    merged = ydoc.missing_from(base64.b64decode(encoded), bytes(stored))
-                except Exception as error:  # not a document Halo can read: Plane's own checks answer it
+                    merged = ydoc.missing_from(base64.b64decode(encoded), bytes(page.description_binary))
+                except Exception as error:  # not a document Halo can read: Plane's serializer answers it
                     log_exception(error)
-                    merged = None
-                if merged:
-                    union, missing = merged
-                    data = dict(request.data.items())
-                    data["description_binary"] = base64.b64encode(union).decode()
-                    request._full_data = data
-            response = super().partial_update(request, slug, project_id, page_id)
-        if missing and response.status_code == status.HTTP_200_OK:
+            if merged:
+                union, missing = merged
+                data["description_binary"] = base64.b64encode(union).decode()
+            old_description_html = page.description_html
+            existing_instance = json.dumps({"description_html": old_description_html}, cls=DjangoJSONEncoder)
+            serializer = PageBinaryUpdateSerializer(page, data=data, partial=True)
+            if not serializer.is_valid():
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            serializer.save()
+            if encoded:
+                # A merged save's HTML is the editor's older text; the next complete save brings it up to date.
+                (lease.mark_text_behind if merged else lease.clear_text_behind)(page.pk)
+            if data.get("description_html"):
+                new_html = data["description_html"]
+                transaction.on_commit(lambda: page_transaction.delay(
+                    new_description_html=new_html, old_description_html=old_description_html, page_id=page_id))
+            user_id = request.user.id
+            transaction.on_commit(lambda: track_page_version.delay(
+                page_id=page_id, existing_instance=existing_instance, user_id=user_id))
+        if missing:
             try:
                 live.publish_update(page_id, missing)
             except Exception as error:  # the merged document is saved; the editor gets it on its next load
                 log_exception(error)
-        return response
+        return Response({"message": "Updated successfully"})

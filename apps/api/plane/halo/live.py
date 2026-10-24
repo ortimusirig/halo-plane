@@ -39,7 +39,7 @@ def convert_html(html: str) -> tuple[bytes, dict]:
         reply = requests.post(
             urljoin(LIVE_URL, "convert-document/"),
             json={"description_html": html, "variant": "document"},
-            timeout=15,
+            timeout=10,
         )
     except requests.RequestException as error:
         raise LiveUnavailable(str(error)) from error

@@ -15,11 +15,11 @@ base=${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.1}
 mount=()
 if [ "${1:-}" = "--dev" ]; then
   shift
-  base=makeplane/plane-backend:v1.4.2
+  base=${HALO_UPSTREAM_IMAGE:-makeplane/plane-backend:v1.4.2}
   mount=(-v "$root/apps/api/plane:/code/plane:ro")
 elif [ "${1:-}" = "--upstream" ]; then
   shift
-  base=makeplane/plane-backend:v1.4.2
+  base=${HALO_UPSTREAM_IMAGE:-makeplane/plane-backend:v1.4.2}
 fi
 [ $# -gt 0 ] || set -- plane/halo/tests
 

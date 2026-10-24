@@ -12,7 +12,7 @@ from pycrdt import Doc, XmlFragment
 
 from plane.db.models import APIToken, Page, PageVersion, Project, ProjectMember, ProjectPage
 from plane.halo import lease, ydoc
-from plane.halo.tests.conftest import live_channel
+from plane.halo.tests.conftest import doc_for, live_channel
 
 pytestmark = pytest.mark.django_db
 
@@ -285,6 +285,60 @@ def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_cli
     assert published  # the editor that saved gets the part it missed
     stale.apply_update(published[0])
     assert str(stale.get(ydoc.BODY, type=XmlFragment)) == str(saved.get(ydoc.BODY, type=XmlFragment))
+    # The stored HTML is that editor's older text until it saves again: reads say so, edits wait.
+    assert world.owner.client.get(url).json()["text_complete"] is False
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    waiting = world.owner.client.patch(url, {"description_html": "<p>x</p>", "expected_updated_at": stamp},
+                                       format="json")
+    assert (waiting.status_code, waiting.json()["code"]) == (409, "page_text_behind")
+    # The editor's next save, made after it received the missing part, is complete and clears the mark.
+    text.insert(len(text), "!")
+    complete = api_client.patch(_description_url(world), {
+        "description_binary": base64.b64encode(stale.get_update()).decode(),
+        "description_html": "<p>Alpha typed!</p><p>Beta by AURA</p><p>Gamma</p>"}, format="json")
+    assert complete.status_code == 200
+    assert world.owner.client.get(url).json()["text_complete"] is True
+
+
+def test_editor_save_starts_version_tasks_only_after_commit(world, api_client, no_celery,
+                                                            django_capture_on_commit_callbacks):
+    current = Doc()
+    current.apply_update(bytes(world.public.description_binary))
+    text = current.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")
+    api_client.force_authenticate(user=world.owner.user)
+    with django_capture_on_commit_callbacks(execute=False) as callbacks:
+        response = api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(current.get_update()).decode(),
+            "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p>"}, format="json")
+        assert response.status_code == 200
+        no_celery.assert_not_called()  # nothing queued while the save is not committed
+    assert len(callbacks) == 2  # page_transaction and track_page_version, once committed
+    for callback in callbacks:
+        callback()
+    assert no_celery.call_count == 2
+
+
+def test_first_load_builds_the_document_from_the_html(world, fake_live, api_client):
+    page = world.make_page(world.owner, "Fresh", "<p>One</p><p>Two</p>", binary=False)
+    before = page.updated_at
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
+    response = api_client.get(url)
+    assert response.status_code == 200
+    body = b"".join(response.streaming_content)
+    page.refresh_from_db()
+    assert body == bytes(page.description_binary) and body
+    assert ydoc.body_signature(body) == ydoc.body_signature(doc_for(["One", "Two"]))
+    assert page.updated_at == before  # building the document is not a change
+    assert fake_live.calls == ["<p>One</p><p>Two</p>"]
+
+
+def test_editor_load_fails_rather_than_read_a_page_an_edit_still_holds(world, api_client):
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.lease.WAIT_SECONDS", 0.3), lease.edit_lease(world.public.id):
+        response = api_client.get(_description_url(world))
+    assert (response.status_code, response.json()["code"]) == (503, "edit_in_progress")
 
 
 def test_editor_save_that_knows_everything_is_plane_unchanged(world, api_client):

@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
 # Release gate for a newer Plane CE release, before upgrading Halo.
 #
-#   bash halo/upgrade-check.sh <newer Plane tag, for example v1.4.3>               (the gate)
-#   bash halo/upgrade-check.sh <tag> --check-only     (patch and compatibility report only; NOT a gate)
+#   bash halo/upgrade-check.sh <new tag> [--candidate <branch>] [--check-only]
 #
-# Halo runs one release behind Plane's newest and never downgrades, so a tag that is not newer than the base in
-# halo/release.env is refused (semantic order: v1.4.3-rc1 < v1.4.3). The gate applies this branch's patch to
-# the new tag, builds the image on the new upstream image, and runs the Halo tests and the end-to-end test with
-# the new live image. It passes only when all of that passes and no compatibility item is open. Nothing here
-# changes this branch or any deployment.
+# Run it from the deployed branch: its halo/release.env names the release Halo runs (PLANE_TAG). The candidate
+# is the branch to ship (default: this one). When the patch does not apply to the new tag, make a candidate:
+# a branch from the new tag with the Halo commits rebased onto it and its own halo/release.env set to the new
+# tag; then run the gate again with --candidate <that branch>. The candidate's patch is always its diff from its
+# own base.
+#
+# Halo runs one release behind Plane's newest and never downgrades: the new tag must be newer than the deployed
+# release (semantic order: v1.4.3-rc1 < v1.4.3). The gate checks the patch against the new tag, builds the image
+# on the new upstream image, runs the Halo tests, Plane's own tests (no new failures against the upstream image)
+# and the end-to-end test with the new live image. It passes only when all of that passes and no compatibility
+# item is open. --check-only gives the report without building or testing; it is not a gate. Nothing here
+# changes a branch or a deployment.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 # shellcheck source=release.env
 . halo/release.env
+deployed=$PLANE_TAG
 
 new=${1:?give the new Plane tag, for example v1.4.3}
-mode=${2:-gate}
+shift
+candidate=HEAD
+mode=gate
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --candidate) candidate=${2:?give the candidate branch}; shift 2 ;;
+    --check-only) mode=check; shift ;;
+    *) echo "unknown argument: $1"; exit 2 ;;
+  esac
+done
+
 py=$(command -v python3 || command -v python)
 newer=$("$py" -c '
 import re, sys
@@ -27,11 +44,17 @@ def key(tag):
     major, minor, patch, rc = match.groups()
     return (int(major), int(minor), int(patch), int(rc) if rc else float("inf"))
 print("yes" if key(sys.argv[2]) > key(sys.argv[1]) else "no")
-' "$PLANE_TAG" "$new")
+' "$deployed" "$new")
 if [ "$newer" != "yes" ]; then
-  echo "FAIL: $new is not newer than $PLANE_TAG (Halo never downgrades)"
+  echo "FAIL: $new is not newer than the deployed $deployed (Halo never downgrades)"
   exit 1
 fi
+candidate_base=$(git show "$candidate:halo/release.env" | sed -n 's/^PLANE_TAG=//p')
+if [ "$candidate_base" != "$deployed" ] && [ "$candidate_base" != "$new" ]; then
+  echo "FAIL: candidate $candidate is built on $candidate_base, neither the deployed $deployed nor $new"
+  exit 1
+fi
+echo "deployed $deployed, new $new, candidate $candidate (based on $candidate_base)"
 
 git fetch -q --depth 1 origin "refs/tags/$new:refs/tags/$new"
 mkdir -p halo/patch
@@ -39,14 +62,14 @@ work="$(pwd -W 2>/dev/null || pwd)/halo/patch/worktree-$new"
 git worktree remove --force "$work" >/dev/null 2>&1 || true
 git worktree add -q --detach "$work" "$new"
 trap 'git worktree remove --force "$work"' EXIT
-git diff --binary "$PLANE_TAG" HEAD -- apps/api > "$work/halo.patch"
+git diff --binary "$candidate_base" "$candidate" -- apps/api > "$work/halo.patch"
 
 failures=0
 open_items=0
 if (cd "$work" && git apply --check halo.patch); then
   echo "OK   patch applies to $new"
 else
-  echo "FAIL patch does not apply to $new: rebase halo/pages-api onto $new and resolve"
+  echo "FAIL patch does not apply to $new: make a candidate branch rebased onto $new (see the header)"
   failures=$((failures + 1))
 fi
 
@@ -54,7 +77,7 @@ task="$work/apps/api/plane/bgtasks/page_version_task.py"
 if grep -qE "page\.description([^_a-z]|$)" "$task"; then
   echo "OK   version-history fix still needed: $new still reads page.description"
 else
-  echo "OPEN version-history fix: $new no longer reads page.description; drop that part of the hunk when rebasing"
+  echo "OPEN version-history fix: $new no longer reads page.description; keep only Halo's marked-version line"
   open_items=$((open_items + 1))
 fi
 if grep -rlqE "pages" "$work/apps/api/plane/api/urls/"; then
@@ -63,13 +86,22 @@ if grep -rlqE "pages" "$work/apps/api/plane/api/urls/"; then
 else
   echo "OK   Plane's API v1 still has no page routes"
 fi
-if grep -q "class PagesDescriptionViewSet" "$work/apps/api/plane/app/views/page/base.py" \
+fingerprint=$("$py" -c '
+import ast, hashlib, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for node in ast.walk(ast.parse(src)):
+    if isinstance(node, ast.ClassDef) and node.name == "PagesDescriptionViewSet":
+        print(" ".join(item.name + "=" + hashlib.sha256(ast.get_source_segment(src, item).encode()).hexdigest()[:16]
+                       for item in node.body if isinstance(item, ast.FunctionDef)))
+' "$work/apps/api/plane/app/views/page/base.py")
+if [ "$fingerprint" = "$UPSTREAM_DESCRIPTION_FINGERPRINT" ] \
   && grep -q '"workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/description/"' \
      "$work/apps/api/plane/app/urls/page.py"; then
-  echo "OK   Plane's description endpoint (overridden by plane/halo/app_urls.py) keeps its name and path"
+  echo "OK   Plane's description endpoint is unchanged (Halo's subclass mirrors it)"
 else
-  echo "FAIL Plane's description endpoint moved or was renamed: update plane/halo/app_urls.py and views.py"
-  failures=$((failures + 1))
+  echo "OPEN Plane's description endpoint changed ($fingerprint): port the change to plane/halo/views.py"
+  echo "     HaloPagesDescriptionViewSet and update UPSTREAM_DESCRIPTION_FINGERPRINT"
+  open_items=$((open_items + 1))
 fi
 hocuspocus=$(grep -E '"@hocuspocus/server"' "$work/pnpm-workspace.yaml" | tr -d ' "' || true)
 if [ "$hocuspocus" = "@hocuspocus/server:2.15.2" ]; then
@@ -81,11 +113,11 @@ fi
 if grep -q 'Controller("/convert-document")' "$work/apps/live/src/controllers/document.controller.ts"; then
   echo "OK   live still has /convert-document/"
 else
-  echo "FAIL live has no /convert-document/ any more: body edits cannot convert HTML"
+  echo "FAIL live has no /convert-document/ any more: text edits cannot convert HTML"
   failures=$((failures + 1))
 fi
 
-if [ "$mode" = "--check-only" ]; then
+if [ "$mode" = check ]; then
   echo "CHECK ONLY: $failures failed, $open_items open; this is not a release gate (no build, no tests)"
   [ "$failures" = 0 ]
   exit
@@ -98,9 +130,21 @@ fi
 image="plane-backend-halo:${new}-candidate"
 cp "$work/halo.patch" halo/patch/halo.patch
 docker build -q -f halo/Dockerfile.backend --build-arg PLANE_IMAGE="makeplane/plane-backend:$new" \
-  --build-arg HALO_REVISION="$(git rev-parse HEAD)" -t "$image" halo >/dev/null
+  --build-arg HALO_REVISION="$(git rev-parse "$candidate")" -t "$image" halo >/dev/null
 echo "OK   built $image"
 HALO_BACKEND_IMAGE="$image" bash halo/test-backend.sh plane/halo/tests -q
+# Plane's own tests: the patched image may not add a failure to those of the upstream image.
+listing() { grep -E "^(FAILED|ERROR) plane/" | sed 's/ - .*//' | sort; }
+HALO_UPSTREAM_IMAGE="makeplane/plane-backend:$new" bash halo/test-backend.sh --upstream plane/tests -q \
+  2>&1 | listing > halo/patch/upstream-failures.txt || true
+HALO_BACKEND_IMAGE="$image" bash halo/test-backend.sh plane/tests -q 2>&1 | listing > halo/patch/halo-failures.txt || true
+added=$(comm -13 halo/patch/upstream-failures.txt halo/patch/halo-failures.txt)
+if [ -n "$added" ]; then
+  echo "FAIL Plane tests that fail only with Halo's patch:"
+  echo "$added"
+  exit 1
+fi
+echo "OK   Plane's own tests: no failure beyond the upstream image's $(wc -l < halo/patch/upstream-failures.txt)"
 HALO_BACKEND_IMAGE="$image" PLANE_LIVE_IMAGE="makeplane/plane-live:$new" bash halo/e2e/run.sh
 if [ "$open_items" != 0 ]; then
   echo "GATE OPEN: tests pass, but $open_items compatibility item(s) above need a decision"

@@ -190,3 +190,25 @@ def test_api_versions_are_marked(world, fake_live):
     result = _edit(world, html="<p>Other</p>")
     for version_id in (result["before_version_id"], result["after_version_id"]):
         assert PageVersion.objects.get(pk=version_id).sub_pages_data == {"halo_api_edit": True}
+
+
+@pytest.mark.django_db
+def test_edit_waits_while_the_stored_html_lags_an_editor(world, fake_live):
+    from plane.halo import lease
+
+    lease.mark_text_behind(world.public.id)
+    with pytest.raises(edit.EditRefused) as refused:
+        _edit(world, html="<p>Other</p>")
+    assert (refused.value.status, refused.value.code) == (409, "page_text_behind")
+    lease.clear_text_behind(world.public.id)
+    assert _edit(world, html="<p>Other</p>")["changed"]
+
+
+@pytest.mark.django_db
+def test_appends_cannot_grow_a_page_past_plane_s_limit(world, fake_live):
+    # Each fragment is small; the page after the edit is what Plane's limit is checked on.
+    with patch("plane.utils.content_validator.MAX_SIZE", len(ORIGINAL) + 20):
+        with pytest.raises(edit.EditRefused) as refused:
+            _edit(world, html="<p>" + "x" * 30 + "</p>", append=True)
+    assert (refused.value.status, refused.value.code) == (400, "page_too_large")
+    assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL

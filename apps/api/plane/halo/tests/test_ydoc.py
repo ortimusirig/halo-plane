@@ -136,7 +136,45 @@ def test_block_ids_from_the_browser_editor_do_not_make_blocks_differ():
     doc.apply_update(edit.state)
     blocks = doc.get(ydoc.BODY, type=XmlFragment).children
     assert blocks[0].attributes["id"] == "b1"  # kept, not replaced
-    assert str(blocks[1]) == "<paragraph>Beta, edited</paragraph>"
+    assert blocks[1].attributes["id"] == "b2"  # edited in place, so it keeps its id too
+    assert "".join(chunk for chunk, _ in blocks[1].children[0].diff()) == "Beta, edited"
+
+
+def test_offline_typing_in_the_edited_paragraph_survives():
+    old = page(p("Alpha"), p("The plan is short"))
+    client = Doc()
+    client.apply_update(old)
+    before = client.get_state()
+    text = client.get(ydoc.BODY, type=XmlFragment).children[1].children[0]
+    text.insert(len(text), " and clear")  # typed offline at the end of the paragraph the API edits
+    offline = client.get_update(before)
+    edit = ydoc.edit_document(old, new_body=page(p("Alpha"), p("The new plan is short")))
+    server = Doc()
+    server.apply_update(edit.state)
+    server.apply_update(offline)
+    client.apply_update(edit.update)
+    assert str(server.get(ydoc.BODY, type=XmlFragment)) == str(client.get(ydoc.BODY, type=XmlFragment))
+    assert str(server.get(ydoc.BODY, type=XmlFragment)) == (
+        "<paragraph>Alpha</paragraph><paragraph>The new plan is short and clear</paragraph>"
+    )
+
+
+def test_attribute_and_formatting_changes_keep_the_element():
+    old = page(("heading", {"level": 2.0, "id": "h1"}, [("Plan", None)]), p("plain words"))
+    new = page(("heading", {"level": 3.0}, [("Plan", None)]), p("plain words", {"bold": {}}))
+    edit = ydoc.edit_document(old, new_body=new)
+    assert ydoc.body_signature(edit.state) == ydoc.body_signature(new)
+    doc = Doc()
+    doc.apply_update(edit.state)
+    heading = doc.get(ydoc.BODY, type=XmlFragment).children[0]
+    assert (heading.attributes["level"], heading.attributes["id"]) == (3.0, "h1")
+
+
+def test_unicode_text_edits_land_at_the_right_place():
+    old = page(p("café \U0001f389 हिं end"))
+    new = page(p("café \U0001f389 X हिं end!"))
+    edit = ydoc.edit_document(old, new_body=new)
+    assert ydoc.body_signature(edit.state) == ydoc.body_signature(new)
 
 
 def test_append_adds_blocks_and_deletes_nothing():

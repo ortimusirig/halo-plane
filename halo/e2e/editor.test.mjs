@@ -109,6 +109,11 @@ const docA = new Y.Doc();
 let editorA = await connect(docA, pageId);
 await waitFor(() => blocks(docA).length === 3);
 check("2 editor opens the page", JSON.stringify(blocks(docA)) === '["Alpha","Beta","Gamma"]', JSON.stringify(blocks(docA)));
+// The first document came from Halo (built from the HTML when live loaded the page), not from live's own conversion.
+const built = inApi(
+  `from plane.db.models import Page; p = Page.objects.get(pk="${pageId}"); print(bool(p.description_binary))`,
+);
+check("2b Halo built the page's first document", built.split(/\r?\n/).pop() === "True", built);
 
 // 3. An API edit while A has it open is refused, and nothing changes.
 const refused = await api("PATCH", `pages/${pageId}/`, {
@@ -130,10 +135,11 @@ check("4a live saved the editor's typing", Boolean(saved), (await page(pageId)).
 const tracked = await waitFor(async () => (await versionTexts(pageId)).some((html) => html.includes("Alpha typed live")), 20000);
 check("4b a save in Halo creates a page version", Boolean(tracked), JSON.stringify(await versionTexts(pageId)));
 
-// 5. The browser's cached copy, with offline typing in another block.
+// 5. The browser's cached copy, with offline typing in another block and in the block AURA will edit.
 const docA2 = new Y.Doc();
 Y.applyUpdate(docA2, Y.encodeStateAsUpdate(docA));
 textAt(docA2, 2).insert(textAt(docA2, 2).length, " offline");
+textAt(docA2, 1).insert(0, "Draft: ");
 
 // 6. The API edit (AURA) on the closed page. Live is still subscribed to the page's channel (it does not
 // unsubscribe after the last editor leaves), so this also proves a closed page is told apart from an open one.
@@ -154,16 +160,16 @@ check("6b edit applied with before and after versions",
 
 // 7. The cached copy reconnects: everyone's text is there once.
 editorA = await connect(docA2, pageId);
-await waitFor(() => blocks(docA2)[1] === "Beta edited by AURA");
-check("7 cached copy merges with no duplicates",
-  JSON.stringify(blocks(docA2)) === '["Alpha typed live","Beta edited by AURA","Gamma offline"]',
+await waitFor(() => blocks(docA2)[1] === "Draft: Beta edited by AURA");
+check("7 cached copy merges with no duplicates, offline typing in AURA's block kept",
+  JSON.stringify(blocks(docA2)) === '["Alpha typed live","Draft: Beta edited by AURA","Gamma offline"]',
   JSON.stringify(blocks(docA2)));
 
 // 8. Saved text has all three changes; the before version has the original Beta.
 closeEditor(editorA);
 const final = await waitFor(async () => {
   const html = (await page(pageId)).description_html;
-  return (await closed(pageId)) && html.includes("Gamma offline") && html.includes("Beta edited by AURA") && html.includes("Alpha typed live") ? html : null;
+  return (await closed(pageId)) && html.includes("Gamma offline") && html.includes("Draft: Beta edited by AURA") && html.includes("Alpha typed live") ? html : null;
 });
 check("8a saved text has every change", Boolean(final), (await page(pageId)).description_html);
 const before = (await api("GET", `pages/${pageId}/versions/${edited.data.before_version_id}/`)).data.description_html;

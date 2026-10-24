@@ -18,7 +18,7 @@ from django.utils.dateparse import parse_datetime
 
 from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page
-from plane.utils.content_validator import validate_html_content
+from plane.utils.content_validator import validate_binary_data, validate_html_content
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, versions, ydoc
@@ -82,7 +82,22 @@ def edit_page(
         raise EditRefused(409, "edit_in_progress", "Another edit of this page is in progress; try again shortly.")
 
 
+def _check_size(html: str, binary) -> None:
+    """Plane's own limits for a saved page (content_validator), on the whole page after the edit."""
+    valid, error, _ = validate_html_content(html)
+    if valid and binary:
+        valid, error = validate_binary_data(bytes(binary))
+    if not valid:
+        raise EditRefused(400, "page_too_large", f"The page would be too large after this edit: {error}")
+
+
 def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal) -> dict:
+    if lease.text_behind(page.id):
+        raise EditRefused(
+            409, "page_text_behind",
+            "Halo is still taking in the latest text of this page from someone's editor. Ask them to make any "
+            "small change in the page (or wait until they do), then read the page again.",
+        )
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
     clean = new_body = new_json = None
@@ -133,6 +148,8 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
             page.name = name
             if page.description_binary and document.changed:
                 page.description_binary = document.state
+        if body_changed:
+            _check_size(page.description_html, page.description_binary)
         page.save()
         before = after = None
         if body_changed:

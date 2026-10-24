@@ -5,13 +5,15 @@
 """Change a page's Yjs document so that every copy of it can merge the change.
 
 Plane's editor keeps a page as a Yjs document (body in fragment "default", title in "title"), and browsers keep
-their own copy. A change must therefore be an update on that same document, never a new document: only the
-top-level blocks that differ are replaced (a sequence diff), and the others keep their identity, so typing in
-them merges. Blocks are compared without the "id" attribute that the browser editor's UniqueID extension adds
-and live's converter never produces.
+their own copy. A change must therefore be an update on that same document, never a new document. The new
+document is laid over the old one node by node (sequence diffs of children, character diffs of text): nodes
+that stay keep their identity, and a changed paragraph is edited in place, so typing in it on another copy
+merges. Nodes are compared without the "id" attribute that the browser editor's UniqueID extension adds and
+live's converter never produces.
 """
 
 import difflib
+import itertools
 import json
 from collections import Counter
 from typing import NamedTuple
@@ -70,34 +72,117 @@ def _fill(target, source) -> None:
             _fill(target.children.append(XmlElement(child.tag, dict(child.attributes))), child)
 
 
-def _insert_block(body: XmlFragment, index: int, block) -> None:
-    if isinstance(block, XmlText):
-        raise ValueError("a page body holds blocks, not loose text")
-    _fill(body.children.insert(index, XmlElement(block.tag, dict(block.attributes))), block)
+def _insert_node(parent, index: int, node) -> None:
+    if isinstance(node, XmlText):
+        text = parent.children.insert(index, XmlText())
+        for chunk, attrs in node.diff():
+            if isinstance(chunk, str):
+                text.insert(len(text), chunk, attrs)
+            else:
+                text.insert_embed(len(text), chunk, attrs)
+    else:
+        _fill(parent.children.insert(index, XmlElement(node.tag, dict(node.attributes))), node)
 
 
-def _replace_blocks(body: XmlFragment, new_body: XmlFragment) -> bool:
-    old, new = list(body.children), list(new_body.children)
-    matcher = difflib.SequenceMatcher(
-        None, [_signature(n) for n in old], [_signature(n) for n in new], autojunk=False
-    )
+def _units(text: XmlText):
+    """The text as (character, formatting) pairs; None when it holds embeds."""
+    units = []
+    for chunk, attrs in text.diff():
+        if not isinstance(chunk, str):
+            return None
+        key = json.dumps(attrs, sort_keys=True, default=str) if attrs else ""
+        units.extend((character, key) for character in chunk)
+    return units
+
+
+def _patch_text(text: XmlText, new: XmlText) -> bool:
+    old_units, new_units = _units(text), _units(new)
+    if old_units is None or new_units is None:  # embeds (not used by Plane's editor): rewrite the text
+        if text.diff() == new.diff():
+            return False
+        del text[0 : len(text)]
+        for chunk, attrs in new.diff():
+            if isinstance(chunk, str):
+                text.insert(len(text), chunk, attrs)
+            else:
+                text.insert_embed(len(text), chunk, attrs)
+        return True
+    if old_units == new_units:
+        return False
+    old_string = "".join(character for character, _ in old_units)
+    matcher = difflib.SequenceMatcher(None, old_units, new_units, autojunk=False)
+    # pycrdt counts text positions in UTF-8 bytes; from the end backwards, earlier positions stay valid.
+    for operation, old_start, old_end, new_start, new_end in reversed(matcher.get_opcodes()):
+        if operation == "equal":
+            continue
+        start = len(old_string[:old_start].encode("utf-8"))
+        end = len(old_string[:old_end].encode("utf-8"))
+        if end > start:
+            del text[start:end]
+        position = start
+        for key, run in itertools.groupby(new_units[new_start:new_end], key=lambda unit: unit[1]):
+            chunk = "".join(character for character, _ in run)
+            text.insert(position, chunk, json.loads(key) if key else None)
+            position += len(chunk.encode("utf-8"))
+    return True
+
+
+def _patch_element(element: XmlElement, new: XmlElement) -> bool:
     changed = False
-    # From the end backwards, so the indexes of earlier blocks stay valid.
+    old_attributes = dict(element.attributes)
+    new_attributes = {key: value for key, value in dict(new.attributes).items() if key != EDITOR_ID}
+    for key in old_attributes:
+        if key != EDITOR_ID and key not in new_attributes:
+            del element.attributes[key]
+            changed = True
+    for key, value in new_attributes.items():
+        if old_attributes.get(key) != value:
+            element.attributes[key] = value
+            changed = True
+    return _patch_children(element, new) or changed
+
+
+def _same_kind(node, new) -> bool:
+    if isinstance(node, XmlText) or isinstance(new, XmlText):
+        return isinstance(node, XmlText) and isinstance(new, XmlText)
+    return node.tag == new.tag
+
+
+def _patch_children(parent, new_parent) -> bool:
+    """Lay new_parent's children over parent's: keep equal nodes, edit paired nodes in place, add the rest."""
+    old, new = list(parent.children), list(new_parent.children)
+    matcher = difflib.SequenceMatcher(None, [_signature(n) for n in old], [_signature(n) for n in new], autojunk=False)
+    changed = False
+    # From the end backwards, so the indexes of earlier nodes stay valid.
     for operation, old_start, old_end, new_start, new_end in reversed(matcher.get_opcodes()):
         if operation == "equal":
             continue
         changed = True
-        for _ in range(old_end - old_start):
-            del body.children[old_start]
-        for offset, block in enumerate(new[new_start:new_end]):
-            _insert_block(body, old_start + offset, block)
+        paired = min(old_end - old_start, new_end - new_start)
+        for index in range(old_end - 1, old_start + paired - 1, -1):
+            del parent.children[index]
+        for offset, node in enumerate(new[new_start + paired : new_end]):
+            _insert_node(parent, old_start + paired + offset, node)
+        for offset in range(paired):
+            index, node, replacement = old_start + offset, old[old_start + offset], new[new_start + offset]
+            if not _same_kind(node, replacement):
+                del parent.children[index]
+                _insert_node(parent, index, replacement)
+            elif isinstance(node, XmlText):
+                _patch_text(node, replacement)
+            else:
+                _patch_element(node, replacement)
     return changed
+
+
+def _replace_blocks(body: XmlFragment, new_body: XmlFragment) -> bool:
+    return _patch_children(body, new_body)
 
 
 def _append_blocks(body: XmlFragment, new_body: XmlFragment) -> bool:
     added = list(new_body.children)
     for block in added:
-        _insert_block(body, len(body.children), block)
+        _insert_node(body, len(body.children), block)
     return bool(added)
 
 
