@@ -1,0 +1,3 @@
+# Halo (Applexus): Yjs document edits for the page API (apps/api/plane/halo). MIT licensed.
+# Wheel for the backend image (Python 3.12, Alpine musl, x86_64); anyio>=4.4 is already in the image.
+pycrdt==0.14.8 --hash=sha256:8822a1da5a9252b18465b10203780400babbdf75f3284858652490c6ea2a759b
