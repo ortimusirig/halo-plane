@@ -1,0 +1,66 @@
+# Copyright (c) 2026 Applexus Technologies. Halo changes to Plane Community Edition.
+# SPDX-License-Identifier: AGPL-3.0-only
+# See the LICENSE file for details.
+
+import base64
+from unittest.mock import patch
+
+import pytest
+import requests
+
+from plane.halo import live
+from plane.settings.redis import redis_instance
+
+PAGE = "3f2b1c4d-0000-4000-8000-000000000001"
+
+
+def test_message_is_a_hocuspocus_sync_update_with_our_identifier():
+    message = live.sync_update_message(PAGE, b"\x01\x02\x03")
+    assert message[:9] == bytes([8]) + b"halo-api"
+    name = PAGE.encode()
+    # varString(page id), varUint(0 Sync), varUint(2 messageYjsUpdate), varUint8Array(update)
+    assert message[9:] == bytes([len(name)]) + name + bytes([0, 2, 3]) + b"\x01\x02\x03"
+
+
+def test_long_update_length_is_a_var_uint():
+    message = live.sync_update_message(PAGE, b"x" * 300)
+    tail = message[9 + 1 + len(PAGE) + 2 :]
+    assert tail[:2] == bytes([0xAC, 0x02])  # 300 in LEB128
+    assert tail[2:] == b"x" * 300
+
+
+def test_is_open_follows_a_subscriber_on_the_page_channel():
+    assert live.is_open(PAGE) is False
+    pubsub = redis_instance().pubsub()
+    pubsub.subscribe(live.channel(PAGE))
+    try:
+        pubsub.get_message(timeout=2)  # the subscribe confirmation
+        assert live.is_open(PAGE) is True
+        assert live.publish_update(PAGE, b"\x00") == 1
+        message = pubsub.get_message(timeout=2)
+        assert message["data"] == live.sync_update_message(PAGE, b"\x00")
+    finally:
+        pubsub.close()
+
+
+def test_convert_html_posts_to_live_and_decodes():
+    class Reply:
+        status_code = 200
+
+        def json(self):
+            return {"description_binary": base64.b64encode(b"yjs").decode(), "description_json": {"type": "doc"}}
+
+    with patch("plane.halo.live.requests.post", return_value=Reply()) as post:
+        assert live.convert_html("<p>x</p>") == (b"yjs", {"type": "doc"})
+    assert post.call_args.args[0] == "http://live:3000/live/convert-document/"
+    assert post.call_args.kwargs["json"] == {"description_html": "<p>x</p>", "variant": "document"}
+
+
+@pytest.mark.parametrize("failure", [requests.ConnectionError("down"), None])
+def test_convert_html_failure_is_live_unavailable(failure):
+    class Reply:
+        status_code = 500
+
+    with patch("plane.halo.live.requests.post", side_effect=failure, return_value=Reply()):
+        with pytest.raises(live.LiveUnavailable):
+            live.convert_html("<p>x</p>")
