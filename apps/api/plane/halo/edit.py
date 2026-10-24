@@ -59,13 +59,30 @@ def _check(page: Page, expected_updated_at) -> None:
         raise EditRefused(409, "page_changed", "The page changed since it was read; read it again first.")
 
 
+TOO_LARGE = (
+    413,
+    "page_too_large_for_editor",
+    "This page is too large for Halo's editor service to convert (100 kB of HTML); edit it in Halo.",
+)
+
+
 def _convert(html: str):
     try:
         return live.convert_html(html)
     except live.LiveTooLarge:
-        raise EditRefused(413, "page_too_large_for_editor",
-                          "This page is too large for Halo's editor service to convert (100 kB of HTML); "
-                          "edit it in Halo.")
+        raise EditRefused(*TOO_LARGE)
+
+
+def ensure_document(page_pk) -> None:
+    """Give a page its first document, built from its HTML with live's converter, unless it has one (under the
+    page's row lock). updated_at stays: building the document is not a change. Raises live.LiveTooLarge or
+    live.LiveUnavailable when live cannot convert it."""
+    with transaction.atomic():
+        page = Page.objects.select_for_update().only("pk", "description_html", "description_binary").get(pk=page_pk)
+        if page.description_binary:
+            return
+        binary, json_data = live.convert_html(page.description_html or "<p></p>")
+        Page.objects.filter(pk=page_pk).update(description_binary=binary, description_json=json_data)
 
 
 def _publish(page_id, update: bytes):
@@ -143,34 +160,33 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         clean = sanitize(html) or "<p></p>"
         new_body, new_json = _convert(clean)
 
+    try:
+        ensure_document(page.pk)
+    except live.LiveTooLarge:
+        raise EditRefused(*TOO_LARGE)
+
     with transaction.atomic():
         page = Page.objects.select_for_update().get(pk=page.pk)
         _check(page, expected_updated_at)
         if text_behind(page.id):
             raise EditRefused(*TEXT_BEHIND)
+        if not page.description_binary:  # ensure_document gave it one; never edit a page without a document
+            raise EditRefused(409, "page_not_ready", "Halo could not prepare this page for editing; try again.")
         old = {
             "description_html": page.description_html,
             "description_binary": page.description_binary,
             "description_json": page.description_json,
         }
-        update = b""
         if html is not None and append:
             full_html, full_json = old["description_html"] + clean, _joined_json(old["description_json"], new_json)
         else:
             full_html, full_json = clean, new_json
-        if page.description_binary:
-            current = bytes(page.description_binary)
-            document = ydoc.edit_document(current, new_body, name, append=append)
-            update = document.update
-            body_changed = new_body is not None and ydoc.body_signature(document.state) != ydoc.body_signature(current)
-            before_body, after_body = current, document.state
-        else:
-            # Nobody has opened the page yet, so there is no document: live builds it from the HTML on first open.
-            body_changed = html is not None and full_html != old["description_html"]
-            before_body = _convert(old["description_html"])[0] if body_changed and not append else None
-            after_body = new_body
+        current = bytes(page.description_binary)
+        document = ydoc.edit_document(current, new_body, name, append=append)
+        update = document.update
+        body_changed = new_body is not None and ydoc.body_signature(document.state) != ydoc.body_signature(current)
         if body_changed and not append and not allow_removal:
-            lost = ydoc.removed_parts(before_body, after_body)
+            lost = ydoc.removed_parts(current, document.state)
             if lost:
                 raise EditRefused(
                     400, "would_remove_parts",
@@ -182,12 +198,10 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
             return {"changed": False, "before_version_id": None, "after_version_id": None, "open_editors_updated": 0}
         if body_changed:
             page.description_html, page.description_json = full_html, full_json
-            if page.description_binary:
-                page.description_binary = document.state
+        if document.changed:
+            page.description_binary = document.state
         if name_changed:
             page.name = name
-            if page.description_binary and document.changed:
-                page.description_binary = document.state
         if body_changed:
             _check_size(page.description_html, page.description_binary)
         page.save()

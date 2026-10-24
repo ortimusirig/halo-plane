@@ -93,13 +93,36 @@ def test_live_down_changes_nothing(world, fake_live):
 
 
 @pytest.mark.django_db
-def test_page_never_opened_keeps_an_empty_document(world, fake_live):
+def test_page_never_opened_gets_its_document_before_the_edit(world, fake_live):
+    """Never an edit without a document: live then cannot build a second one from the old HTML."""
     page = world.make_page(world.owner, "Fresh", "<p>One</p>", binary=False)
     result = _edit(world, page=page, html="<p>Two</p>")
     page.refresh_from_db()
     assert result["changed"]
-    assert page.description_binary is None
+    assert fake_live.calls == ["<p>Two</p>", "<p>One</p>"]  # the new text, then the page's first document
+    assert ydoc.body_signature(page.description_binary) == ydoc.body_signature(doc_for(["Two"]))
     assert page.description_html == "<p>Two</p>"
+    assert PageVersion.objects.get(pk=result["before_version_id"]).description_html == "<p>One</p>"
+
+
+@pytest.mark.django_db
+def test_append_to_a_never_opened_page_too_large_for_the_converter_is_refused(world, fake_live):
+    from plane.halo.live import LiveTooLarge
+
+    page = world.make_page(world.owner, "Big", "<p>big</p>", binary=False)
+
+    def convert(html):
+        # The small appended part converts; the page's own HTML (for its first document) is too large.
+        if html == "<p>x</p>":
+            return doc_for(["x"]), {}
+        raise LiveTooLarge("over 100 kB")
+
+    with patch("plane.halo.live.convert_html", side_effect=convert):
+        with pytest.raises(edit.EditRefused) as refused:
+            _edit(world, page=page, html="<p>x</p>", append=True)
+    assert (refused.value.status, refused.value.code) == (413, "page_too_large_for_editor")
+    page.refresh_from_db()
+    assert page.description_binary is None and page.description_html == "<p>big</p>"
 
 
 @pytest.mark.django_db

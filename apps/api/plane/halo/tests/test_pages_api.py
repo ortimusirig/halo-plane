@@ -326,6 +326,48 @@ def test_first_load_of_a_page_too_large_for_the_converter_is_left_to_live(world,
     assert page.description_binary is None  # live converts it itself, as in stock Plane
 
 
+def test_first_load_fails_rather_than_let_live_convert_when_the_converter_is_down(world, fake_live, api_client):
+    page = world.make_page(world.owner, "Fresh", "<p>x</p>", binary=False)
+    fake_live.down = True
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
+    response = api_client.get(url)
+    assert (response.status_code, response.json()["code"]) == (503, "live_unavailable")
+
+
+def test_a_save_without_html_does_not_clear_the_lagging_mark(world, api_client):
+    from django.utils import timezone
+
+    from plane.halo.models import PageTextBehind
+
+    PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now())
+    api_client.force_authenticate(user=world.owner.user)
+    binary_only = {"description_binary": base64.b64encode(bytes(world.public.description_binary)).decode()}
+    assert api_client.patch(_description_url(world), binary_only, format="json").status_code == 200
+    assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
+    complete = {**binary_only, "description_html": ORIGINAL}
+    assert api_client.patch(_description_url(world), complete, format="json").status_code == 200
+    assert not PageTextBehind.objects.filter(page_id=world.public.id).exists()
+
+
+def test_version_task_waits_for_the_page_lock_and_skips_lagging_pages(world):
+    import json as json_lib
+
+    from django.utils import timezone
+
+    from plane.halo.models import PageTextBehind
+    from plane.halo.tasks import track_page_version_after_save
+
+    page = world.public
+    old = json_lib.dumps({"description_html": "<p>before</p>"})
+    PageTextBehind.objects.create(page_id=page.id, since=timezone.now())
+    track_page_version_after_save(page_id=page.id, existing_instance=old, user_id=world.owner.user.id)
+    assert not PageVersion.objects.filter(page=page).exists()  # an earlier queued task cannot mix the two
+    PageTextBehind.objects.filter(page_id=page.id).delete()
+    track_page_version_after_save(page_id=page.id, existing_instance=old, user_id=world.owner.user.id)
+    assert PageVersion.objects.get(page=page).description_html == ORIGINAL
+
+
 def test_editor_save_starts_version_tasks_only_after_commit(world, api_client, no_celery,
                                                             django_capture_on_commit_callbacks):
     current = Doc()

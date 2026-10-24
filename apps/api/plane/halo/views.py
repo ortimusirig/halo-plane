@@ -28,14 +28,14 @@ from plane.app.serializers import PageBinaryUpdateSerializer, PageDetailSerializ
 from plane.app.views.page.base import PagesDescriptionViewSet, PageViewSet
 from plane.app.views.page.version import PageVersionEndpoint
 from plane.bgtasks.page_transaction_task import page_transaction
-from plane.bgtasks.page_version_task import track_page_version
 from plane.db.models import Page, PageVersion, Project, ProjectMember
 from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, ydoc
-from .edit import EditRefused, edit_page, sanitize, text_behind
+from .edit import EditRefused, edit_page, ensure_document, sanitize, text_behind
 from .models import PageTextBehind
+from .tasks import track_page_version_after_save
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -251,22 +251,15 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
         page = self._visible_page(request, slug, project_id, page_id)
         if page is not None and not page.description_binary:
             try:
-                self._build_first_document(page.pk)
-            except live.LiveUnavailable as error:
-                # Too large for live's converter (or not reachable): live then converts the page itself, as
-                # in stock Plane. An API edit cannot race it: an edit of this page needs the same converter.
+                ensure_document(page.pk)
+            except live.LiveTooLarge as error:
+                # Too large for live's converter: live converts the page itself, as in stock Plane. API edits
+                # of such a page are refused (they need the same converter), so none can race that.
                 log_exception(error)
+            except live.LiveUnavailable:
+                return _error("Halo's editor service could not prepare the page; reload it in a moment.",
+                              "live_unavailable", status.HTTP_503_SERVICE_UNAVAILABLE)
         return super().retrieve(request, slug, project_id, page_id)
-
-    @staticmethod
-    def _build_first_document(page_pk):
-        with transaction.atomic():
-            page = Page.objects.select_for_update().get(pk=page_pk)
-            if page.description_binary:
-                return
-            binary, json_data = live.convert_html(page.description_html or "<p></p>")
-            # update(), not save(): building the document is not a change, so updated_at stays.
-            Page.objects.filter(pk=page_pk).update(description_binary=binary, description_json=json_data)
 
     def partial_update(self, request, slug, project_id, page_id):
         found = self._visible_page(request, slug, project_id, page_id)
@@ -301,7 +294,8 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             if merged:
                 # The saved HTML is that editor's older text: marked until its next, complete save.
                 PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
-            elif encoded:
+            elif encoded and data.get("description_html"):
+                # Only a save of both the whole document and its HTML is complete.
                 PageTextBehind.objects.filter(page_id=page.pk).delete()
             if data.get("description_html"):
                 new_html = data["description_html"]
@@ -311,7 +305,7 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
                 # A merged save's HTML is that editor's older text, so it makes no version; the editor's next
                 # save, complete because it received the missing part, does.
                 user_id = request.user.id
-                transaction.on_commit(lambda: track_page_version.delay(
+                transaction.on_commit(lambda: track_page_version_after_save.delay(
                     page_id=page_id, existing_instance=existing_instance, user_id=user_id))
         if missing:
             try:
