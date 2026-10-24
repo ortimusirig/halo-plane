@@ -17,6 +17,7 @@ from django.conf import settings
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 
@@ -33,7 +34,8 @@ from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, ydoc
-from .edit import EditRefused, edit_page, sanitize, text_in_sync
+from .edit import EditRefused, edit_page, sanitize, text_behind
+from .models import PageTextBehind
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -93,7 +95,7 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
                     "description_text": page.description_stripped or "",
                     "url": page_url(slug, project_id, page_id),
                     # False while the stored HTML lags an editor's merged save (API edits wait for it).
-                    "text_complete": text_in_sync(page.description_html, page.description_binary),
+                    "text_complete": not text_behind(page_id),
                 }
             )
         return response
@@ -296,6 +298,11 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             if not serializer.is_valid():
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             serializer.save()
+            if merged:
+                # The saved HTML is that editor's older text: marked until its next, complete save.
+                PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
+            elif encoded:
+                PageTextBehind.objects.filter(page_id=page.pk).delete()
             if data.get("description_html"):
                 new_html = data["description_html"]
                 transaction.on_commit(lambda: page_transaction.delay(

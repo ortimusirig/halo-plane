@@ -70,21 +70,26 @@ Halo. Only then switch the backend services to the image.
    a subclass (`HaloPagesDescriptionViewSet`, routed first by `plane/halo/app_urls.py`). Loading waits while an
    API edit of the page runs. A save that lacks part of the stored document (an API edit that editor never
    received) is merged with it instead of overwriting it, and the missing part is sent to that editor through
-   live. Every other request runs Plane's own code.
+   live. Such a save's HTML is that editor's older text, so the page is marked in Halo's own table
+   (`halo_page_text_behind`, same transaction) until that editor's next, complete save: reads report
+   `text_complete: false`, API edits wait, and the merged save makes no page version. A page's first document
+   is built here from its HTML (live's converter) when it is first loaded, so live never converts on its own
+   while an API edit writes the same page. The save itself mirrors Plane's code, with its background tasks
+   started after commit.
 
 4. Fix of Plane CE v1.4.2's page version history: `bgtasks/page_version_task.py` read `page.description`,
    which does not exist (`description_json` does), so no page version was ever written. The same task skips
    Halo's marked versions when it merges saves.
 
-Files: `apps/api/plane/halo/` (new), `apps/api/plane/api/urls/__init__.py` and `apps/api/plane/urls.py`
-(includes), `apps/api/plane/bgtasks/page_version_task.py` (fix and marked versions),
+Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with one table and its migration),
+`apps/api/plane/settings/common.py` (the app in `INSTALLED_APPS`), `apps/api/plane/api/urls/__init__.py` and
+`apps/api/plane/urls.py` (includes), `apps/api/plane/bgtasks/page_version_task.py` (fix and marked versions),
 `apps/api/requirements/base.txt` (`pycrdt==0.14.8`), and this `halo/` folder (build, tests, upgrade gate).
 
-Known limits: an editor that opens a page within the same instant as an API edit, on a page nobody has ever
-opened (no document yet), can replace the edit with the old text when live stores its first conversion; the
-edit stays in the version history. Typing in a block that an API edit rewrites is lost only if live misses
-the half-second probe while the page is open. A merged save keeps the document complete; its stored HTML
-catches up with the next save from that editor.
+Known limits: typing on an open page can be lost only where an API edit rewrote the same characters while
+live missed the half-second open-page probe. Pages over 100 kB of HTML (live's converter limit) cannot be
+edited through the API, and their first document is built by live itself, as in stock Plane. A marked page
+stays marked until an editor saves it again (any small change).
 
 ## Build and test
 
@@ -99,7 +104,8 @@ bash halo/e2e/run.sh                       # end-to-end proof with Plane's real 
 `build-backend.sh` turns the committed diff from `PLANE_TAG` into `halo/patch/halo.patch`, and
 `Dockerfile.backend` applies it with `git apply` to the code inside `makeplane/plane-backend:v1.4.2`;
 a patch that no longer applies stops the build. The image replaces the `api`, `worker`, `beat-worker`
-and `migrator` images of a Plane deployment; the patch has no database migrations. The live service
+and `migrator` images of a Plane deployment; run the migrator once (Halo's table, migration
+`halo.0001_initial`; no change to Plane's tables). The live service
 stays the upstream image; the API reaches it at `HALO_LIVE_URL` (default `http://live:3000/live/`).
 
 ## Upgrade
@@ -114,4 +120,5 @@ it is not a gate.
 ## Rollback
 
 Set the four backend services back to `makeplane/plane-backend:v1.4.2`. Page versions written by the
-patched build stay in `page_versions`; stock Plane reads them as normal versions.
+patched build stay in `page_versions`; stock Plane reads them as normal versions. The table
+`halo_page_text_behind` stays and is unused by stock Plane (drop it only when Halo's patch is retired).

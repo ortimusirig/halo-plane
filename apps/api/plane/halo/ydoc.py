@@ -235,22 +235,6 @@ def edit_document(
     return DocumentEdit(doc.get_update(), doc.get_update(before) if changed else b"", changed)
 
 
-def body_text(binary: bytes) -> str:
-    """All the text in the body, without formatting (to compare with the stored HTML's text)."""
-    parts = []
-
-    def walk(node):
-        for child in node.children:
-            if isinstance(child, XmlText):
-                parts.extend(chunk for chunk, _ in child.diff() if isinstance(chunk, str))
-            else:
-                walk(child)
-
-    if binary:
-        walk(_load(binary).get(BODY, type=XmlFragment))
-    return "".join(parts)
-
-
 def protected_parts(binary: bytes) -> Counter:
     """Images, mentions and embedded work items in the body, counted by what each one points at."""
     parts = Counter()

@@ -11,8 +11,6 @@ document (ydoc). The update is published on live's channel after commit, and aga
 editor that opened the page in that moment still receives it.
 """
 
-import html as html_entities
-import re
 import threading
 
 from django.db import transaction
@@ -22,9 +20,9 @@ from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page
 from plane.utils.content_validator import validate_binary_data, validate_html_content
 from plane.utils.exception_logger import log_exception
-from plane.utils.html_processor import strip_tags
 
 from . import lease, live, versions, ydoc
+from .models import PageTextBehind
 
 REPUBLISH_AFTER_SECONDS = 3
 
@@ -103,18 +101,10 @@ def edit_page(
         raise EditRefused(409, "edit_in_progress", "Another edit of this page is in progress; try again shortly.")
 
 
-def text_in_sync(html: str, binary) -> bool:
-    """Whether the stored HTML says what the document says (it lags after a merged editor save until that
-    editor saves again). Compares the text only, without whitespace; a page without a document is in sync."""
-    if not binary:
-        return True
-    # The editor's emoji node holds only its name in the document but renders its character in the HTML.
-    html = EMOJI_SPAN.sub("", html or "")
-    squash = lambda text: re.sub(r"\s+", "", text)
-    return squash(html_entities.unescape(strip_tags(html))) == squash(ydoc.body_text(bytes(binary)))
-
-
-EMOJI_SPAN = re.compile(r'<span\b[^>]*\bdata-type="emoji"[^>]*>.*?</span>', re.S)
+def text_behind(page_id) -> bool:
+    """Whether the stored HTML lags the document: marked by a merged editor save, cleared by that editor's next
+    complete save (models.PageTextBehind, written in the same transaction as those saves)."""
+    return PageTextBehind.objects.filter(page_id=page_id).exists()
 
 
 TEXT_BEHIND = (
@@ -135,7 +125,7 @@ def _check_size(html: str, binary) -> None:
 
 
 def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal, restore_from) -> dict:
-    if not text_in_sync(page.description_html, page.description_binary):
+    if text_behind(page.id):
         raise EditRefused(*TEXT_BEHIND)
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
@@ -156,7 +146,7 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
     with transaction.atomic():
         page = Page.objects.select_for_update().get(pk=page.pk)
         _check(page, expected_updated_at)
-        if not text_in_sync(page.description_html, page.description_binary):
+        if text_behind(page.id):
             raise EditRefused(*TEXT_BEHIND)
         old = {
             "description_html": page.description_html,

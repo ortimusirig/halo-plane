@@ -241,10 +241,4 @@ def test_long_repetitive_text_is_diffed_quickly_and_correctly():
         started = time.monotonic()
         edit = ydoc.edit_document(old, new_body=page(p(new_text)))
         assert time.monotonic() - started < 3
-        assert ydoc.body_text(edit.state) == new_text
-
-
-def test_body_text_joins_all_text_without_formatting():
-    binary = page(("heading", {"level": 2.0}, [("Plan ", None), ("now", {"bold": {}})]), p("café"))
-    assert ydoc.body_text(binary) == "Plan nowcafé"
-    assert ydoc.body_text(b"") == ""
+        assert ydoc.body_signature(edit.state) == ydoc.body_signature(page(p(new_text)))

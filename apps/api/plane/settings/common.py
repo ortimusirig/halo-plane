@@ -111,6 +111,8 @@ INSTALLED_APPS = [
     "plane.license",
     "plane.api",
     "plane.authentication",
+    # Halo (Applexus): page API patch, with its own table (plane/halo)
+    "plane.halo",
     # Third-party things
     "rest_framework",
     "corsheaders",
