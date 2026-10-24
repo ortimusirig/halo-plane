@@ -764,3 +764,52 @@ def test_an_expired_copy_mark_is_ignored(world, fake_live, api_client):
     response = world.owner.client.patch(url, {"description_html": "<p>new</p>", "expected_updated_at": stamp},
                                         format="json")
     assert response.status_code == 200, response.content
+
+
+def test_create_from_text_without_a_tag_stores_a_paragraph(world):
+    response = world.owner.client.post(world.base, {"name": "Plain", "description_html": "Hello world"}, format="json")
+    assert response.status_code == 201, response.content
+    assert Page.objects.get(pk=response.json()["id"]).description_html == "<p>Hello world</p>"
+
+
+def test_web_app_properties_patch_never_changes_the_text(world, api_client, no_celery):
+    """The web app's page store PATCHes the whole page, its own older copy of the text included."""
+    api_client.force_authenticate(user=world.owner.user)
+    document = bytes(world.public.description_binary)
+    response = api_client.patch(_app_page_url(world), {"name": "Renamed", "description_html": "<p>Older text</p>",
+                                                       "description_binary": "AAAA"}, format="json")
+    assert response.status_code == 200, response.content
+    page = Page.objects.get(pk=world.public.pk)
+    assert (page.name, page.description_html) == ("Renamed", ORIGINAL)
+    assert bytes(page.description_binary) == document
+    assert not any("new_description_html" in call.kwargs for call in no_celery.call_args_list)
+
+
+def test_a_save_of_html_alone_marks_the_text_as_behind(world, api_client):
+    from plane.halo.models import PageTextBehind
+
+    api_client.force_authenticate(user=world.owner.user)
+    response = api_client.patch(_description_url(world), {"description_html": "<p>Older text</p>"}, format="json")
+    assert response.status_code == 200
+    assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["text_complete"] is False
+
+
+def test_create_answers_201_once_although_the_broker_is_down(world):
+    pages = Page.objects.count()
+    with patch("plane.halo.views.page_transaction") as page_transaction:
+        page_transaction.delay.side_effect = RuntimeError("broker down")
+        response = world.owner.client.post(world.base, {"name": "New"}, format="json")
+    assert response.status_code == 201, response.content
+    assert Page.objects.count() == pages + 1
+
+
+def test_duplicate_without_a_broker_leaves_the_copy_usable(world, api_client):
+    from plane.halo.models import PageBeingCopied
+
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.views.finish_page_copy") as finish_page_copy:
+        finish_page_copy.delay.side_effect = RuntimeError("broker down")
+        response = api_client.post(_app_page_url(world, "duplicate/"))
+    assert response.status_code == 201, response.content
+    assert not PageBeingCopied.objects.filter(page_id=response.json()["id"]).exists()

@@ -37,12 +37,20 @@ class LiveTooLarge(LiveUnavailable):
     """Live refused the HTML as too large (its request limit is express.json's default, 100 kB)."""
 
 
+def convertible(html: str) -> str:
+    """HTML that live's converter takes: it refuses empty text and text without a tag (DocumentController's
+    schema), which Plane's sanitizer and older pages allow; such text becomes one paragraph."""
+    if not html or not html.strip():
+        return "<p></p>"
+    return html if "<" in html and ">" in html else f"<p>{html}</p>"
+
+
 def convert_html(html: str) -> tuple[bytes, dict]:
     """Live's conversion of HTML into the page editor's Yjs document and ProseMirror JSON."""
     try:
         reply = requests.post(
             urljoin(LIVE_URL, "convert-document/"),
-            json={"description_html": html, "variant": "document"},
+            json={"description_html": convertible(html), "variant": "document"},
             timeout=10,
         )
     except requests.RequestException as error:

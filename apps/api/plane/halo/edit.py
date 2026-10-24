@@ -39,10 +39,11 @@ class EditRefused(Exception):
 
 
 def sanitize(html: str) -> str:
+    """Plane's sanitizer, and text without a tag made a paragraph (stored as the editor will show it)."""
     valid, error, clean = validate_html_content(html)
     if not valid:
         raise EditRefused(400, "invalid_html", error)
-    return clean if clean is not None else html
+    return live.convertible(clean if clean is not None else html)
 
 
 def _check(page: Page, expected_updated_at) -> None:
@@ -54,7 +55,10 @@ def _check(page: Page, expected_updated_at) -> None:
     if not expected_updated_at:
         raise EditRefused(400, "expected_updated_at_required",
                           "Give expected_updated_at: the page's updated_at from when it was read.")
-    expected = parse_datetime(str(expected_updated_at))
+    try:
+        expected = parse_datetime(str(expected_updated_at))
+    except ValueError:  # well formed but not a date, such as February 30
+        expected = None
     if expected is None:
         raise EditRefused(400, "invalid_expected_updated_at", "expected_updated_at must be the page's updated_at.")
     if expected != page.updated_at:

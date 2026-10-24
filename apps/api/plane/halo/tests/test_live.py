@@ -84,3 +84,19 @@ def test_convert_html_failure_is_live_unavailable(failure):
     with patch("plane.halo.live.requests.post", side_effect=failure, return_value=Reply()):
         with pytest.raises(live.LiveUnavailable):
             live.convert_html("<p>x</p>")
+
+
+@pytest.mark.parametrize("html,sent", [("Hello world", "<p>Hello world</p>"), ("", "<p></p>"), ("  ", "<p></p>"),
+                                       ("a &gt; b", "<p>a &gt; b</p>"), ("<p>x</p>", "<p>x</p>")])
+def test_text_without_a_tag_is_sent_to_live_as_a_paragraph(html, sent):
+    """Live's converter refuses text without a tag (its DocumentController schema); Plane's sanitizer allows it."""
+
+    class Reply:
+        status_code = 200
+
+        def json(self):
+            return {"description_binary": base64.b64encode(b"yjs").decode(), "description_json": {"type": "doc"}}
+
+    with patch("plane.halo.live.requests.post", return_value=Reply()) as post:
+        live.convert_html(html)
+    assert post.call_args.kwargs["json"]["description_html"] == sent

@@ -64,7 +64,8 @@ def test_matching_read_in_another_timezone_is_accepted(world, fake_live):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("stamp,code", [(None, "expected_updated_at_required"), ("", "expected_updated_at_required"),
-                                        ("yesterday", "invalid_expected_updated_at")])
+                                        ("yesterday", "invalid_expected_updated_at"),
+                                        ("2026-02-30T00:00:00Z", "invalid_expected_updated_at")])
 def test_edit_without_a_valid_read_stamp_is_refused(world, fake_live, stamp, code):
     with pytest.raises(edit.EditRefused) as refused:
         _edit(world, html="<p>Other</p>", expected_updated_at=stamp)
