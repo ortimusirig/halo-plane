@@ -153,6 +153,10 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
         if page.parent_id:
             # Plane's page views leave sub-pages out (PageViewSet.get_queryset); so does this API.
             return _error("This page is a sub-page; edit it in Halo.", "page_hierarchy")
+        if not self.get_queryset().filter(pk=page_id).exists():
+            # Plane's own view of the person's pages (archived projects and others' private pages left out):
+            # checked before anything changes, so the answer after the edit can never be a 404.
+            return _error("No such page in this project.", "page_not_found", status.HTTP_404_NOT_FOUND)
         restore_from = None
         if restore_id is not None:
             restore_from = PageVersion.objects.filter(pk=restore_id, page_id=page.id).first()
@@ -221,6 +225,38 @@ class HaloPageVersionEndpoint(PersonalTokenMixin, PageVersionEndpoint):
             version = PageVersion.objects.filter(pk=pk).only("description_stripped").first()
             response.data["description_text"] = (version.description_stripped if version else "") or ""
         return response
+
+
+class HaloAppPageViewSet(PageViewSet):
+    """Plane's own page views for the web app, with one change: the page's row is locked before Plane reads it.
+
+    Plane's lock, access and properties updates read the whole page and save every field. Without the lock, one
+    that read the page while an API edit was running would write the old text back after the edit committed.
+    """
+
+    @staticmethod
+    def _lock_row(page_id):
+        Page.objects.select_for_update().filter(pk=page_id).first()
+
+    def partial_update(self, request, slug, project_id, page_id):
+        with transaction.atomic():
+            self._lock_row(page_id)
+            return super().partial_update(request, slug, project_id, page_id)
+
+    def lock(self, request, slug, project_id, page_id):
+        with transaction.atomic():
+            self._lock_row(page_id)
+            return super().lock(request, slug, project_id, page_id)
+
+    def unlock(self, request, slug, project_id, page_id):
+        with transaction.atomic():
+            self._lock_row(page_id)
+            return super().unlock(request, slug, project_id, page_id)
+
+    def access(self, request, slug, project_id, page_id):
+        with transaction.atomic():
+            self._lock_row(page_id)
+            return super().access(request, slug, project_id, page_id)
 
 
 class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):

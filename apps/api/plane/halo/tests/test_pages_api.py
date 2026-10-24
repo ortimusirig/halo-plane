@@ -486,3 +486,66 @@ def test_archive_refuses_pages_with_sub_pages(world):
         assert world.owner.client.post(url).json()["code"] == "page_hierarchy"
         assert world.admin.client.delete(url).json()["code"] == "page_hierarchy"
     assert not Page.objects.filter(pk__in=[world.public.pk, child.pk], archived_at__isnull=False).exists()
+
+
+def test_edit_in_an_archived_project_is_refused_before_anything_changes(world, fake_live):
+    from django.utils import timezone
+
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    Project.objects.filter(pk=world.project.pk).update(archived_at=timezone.now())
+    response = world.owner.client.patch(url, {"description_html": "<p>new</p>", "expected_updated_at": stamp},
+                                        format="json")
+    assert (response.status_code, response.json()["code"]) == (404, "page_not_found")
+    assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
+    assert not PageVersion.objects.filter(page=world.public).exists()
+
+
+def _app_page_url(world, suffix=""):
+    return f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{world.public.id}/{suffix}"
+
+
+def test_web_app_page_routes_are_halo_s_and_still_work(world, api_client):
+    from django.urls import resolve
+
+    from plane.halo.views import HaloAppPageViewSet
+
+    for suffix in ("", "lock/", "access/"):
+        assert resolve(_app_page_url(world, suffix)).func.cls is HaloAppPageViewSet
+    api_client.force_authenticate(user=world.owner.user)
+    assert api_client.get(_app_page_url(world)).status_code == 200
+    assert api_client.post(_app_page_url(world, "lock/")).status_code == 204
+    assert Page.objects.get(pk=world.public.pk).is_locked is True
+    assert api_client.delete(_app_page_url(world, "lock/")).status_code == 204
+    assert api_client.patch(_app_page_url(world), {"name": "Renamed in Halo"}, format="json").status_code == 200
+    assert Page.objects.get(pk=world.public.pk).name == "Renamed in Halo"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_lock_click_during_an_api_edit_does_not_write_the_old_text_back(world, api_client):
+    """Plane's lock reads and saves the whole page; it must wait for a running edit, then read the new text."""
+    from django.db import connection, transaction
+
+    editing, done = threading.Event(), threading.Event()
+
+    def api_edit():
+        try:
+            with transaction.atomic():
+                page = Page.objects.select_for_update().get(pk=world.public.pk)
+                page.description_html = "<p>Written by the API</p>"
+                page.save()
+                editing.set()
+                time.sleep(0.8)  # the lock click arrives while this edit has not committed
+        finally:
+            connection.close()
+            done.set()
+
+    thread = threading.Thread(target=api_edit)
+    thread.start()
+    editing.wait(5)
+    api_client.force_authenticate(user=world.owner.user)
+    assert api_client.post(_app_page_url(world, "lock/")).status_code == 204
+    thread.join()
+    page = Page.objects.get(pk=world.public.pk)
+    assert page.is_locked is True
+    assert page.description_html == "<p>Written by the API</p>"

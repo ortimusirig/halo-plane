@@ -146,7 +146,9 @@ fi
 image="plane-backend-halo:${new}-candidate"
 cp "$work/halo.patch" halo/patch/halo.patch
 docker build -q -f halo/Dockerfile.backend --build-arg PLANE_IMAGE="makeplane/plane-backend:$new" \
-  --build-arg HALO_REVISION="$(git rev-parse "$candidate")" -t "$image" halo >/dev/null
+  --build-arg HALO_REVISION="$(git rev-parse "$candidate")" --build-arg HALO_TAG="$HALO_TAG" -t "$image" halo >/dev/null
+label=$(docker inspect "$image" --format "{{index .Config.Labels \"org.opencontainers.image.version\"}}")
+[ "$label" = "$HALO_TAG" ] || { echo "FAIL image source label is $label, not $HALO_TAG"; exit 1; }
 echo "OK   built $image"
 HALO_BACKEND_IMAGE="$image" bash halo/test-backend.sh plane/halo/tests -q
 # Plane's own tests: the patched image may not add a failure to those of the upstream image. A run counts only
