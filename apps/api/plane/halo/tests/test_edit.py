@@ -151,3 +151,42 @@ def test_update_is_published_to_open_editors_after_commit(world, fake_live):
     assert len(published) == 2  # right after commit, and once more for an editor that was just opening
     assert published[0] == published[1]
     assert published[0][0] == str(world.public.id) and published[0][1]
+
+
+@pytest.mark.django_db
+def test_edit_that_drops_or_swaps_an_image_is_refused_unless_allowed(world, fake_live):
+    page = world.make_page(world.owner, "Pics", '<p>Intro</p><image-component src="a1"></image-component>')
+    with pytest.raises(edit.EditRefused) as refused:
+        _edit(world, page=page, html='<p>Intro</p><image-component src="b2"></image-component>')
+    assert (refused.value.status, refused.value.code) == (400, "would_remove_parts")
+    assert "image-component a1" in refused.value.message
+    assert _edit(world, page=page, html="<p>Intro</p>", allow_removal=True)["changed"]
+
+
+@pytest.mark.django_db
+def test_append_keeps_every_block_and_adds_at_the_end(world, fake_live):
+    result = _edit(world, html="<p>Delta</p>", append=True)
+    page = Page.objects.get(pk=world.public.pk)
+    assert result["changed"]
+    assert ydoc.body_signature(page.description_binary) == ydoc.body_signature(
+        doc_for(["Alpha", "Beta", "Gamma", "Delta"])
+    )
+    assert page.description_html == ORIGINAL + "<p>Delta</p>"
+
+
+@pytest.mark.django_db
+def test_a_second_edit_while_one_runs_is_refused(world, fake_live):
+    from plane.halo import lease
+
+    with lease.edit_lease(world.public.id):
+        with pytest.raises(edit.EditRefused) as refused:
+            _edit(world, html="<p>Other</p>")
+    assert (refused.value.status, refused.value.code) == (409, "edit_in_progress")
+    assert _edit(world, html="<p>Other</p>")["changed"]  # the lease is free again
+
+
+@pytest.mark.django_db
+def test_api_versions_are_marked(world, fake_live):
+    result = _edit(world, html="<p>Other</p>")
+    for version_id in (result["before_version_id"], result["after_version_id"]):
+        assert PageVersion.objects.get(pk=version_id).sub_pages_data == {"halo_api_edit": True}

@@ -37,6 +37,8 @@ def track_page_version(page_id, existing_instance, user_id):
             # Get the latest page version if it exists and is owned by the user
             if (
                 page_version
+                # Halo: never merge a save into the version an API edit wrote (plane/halo/versions.py).
+                and not (page_version.sub_pages_data or {}).get("halo_api_edit")
                 and str(page_version.owned_by_id) == str(user_id)
                 and (timezone.now() - page_version.last_saved_at).total_seconds() <= PAGE_VERSION_TASK_TIMEOUT
             ):

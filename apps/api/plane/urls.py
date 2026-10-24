@@ -16,6 +16,8 @@ from drf_spectacular.views import (
 handler404 = "plane.app.views.error_404.custom_404_view"
 
 urlpatterns = [
+    # Halo (Applexus): page description route that merges stale editor saves (plane/halo/app_urls.py).
+    path("api/", include("plane.halo.app_urls")),
     path("api/", include("plane.app.urls")),
     path("api/public/", include("plane.space.urls")),
     path("api/instances/", include("plane.license.urls")),

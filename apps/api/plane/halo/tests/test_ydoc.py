@@ -108,3 +108,79 @@ def test_page_without_title_fragment_keeps_it_empty():
     edit = ydoc.edit_document(page(p("Alpha")), name="New name")
     assert not edit.changed
     assert text_of(edit.state, ydoc.TITLE) == ""
+
+
+def test_separate_edits_keep_the_unchanged_block_between_them():
+    old = page(p("Alpha"), p("Beta"), p("Gamma"))
+    new = page(p("Alpha 2"), p("Beta"), p("Gamma 2"))
+    client = Doc()
+    client.apply_update(old)
+    before = client.get_state()
+    beta = client.get(ydoc.BODY, type=XmlFragment).children[1].children[0]
+    beta.insert(len(beta), " offline")
+    offline = client.get_update(before)
+    edit = ydoc.edit_document(old, new_body=new)
+    server = Doc()
+    server.apply_update(edit.state)
+    server.apply_update(offline)
+    assert str(server.get(ydoc.BODY, type=XmlFragment)) == (
+        "<paragraph>Alpha 2</paragraph><paragraph>Beta offline</paragraph><paragraph>Gamma 2</paragraph>"
+    )
+
+
+def test_block_ids_from_the_browser_editor_do_not_make_blocks_differ():
+    # The browser's UniqueID extension stamps an id on every block; live's converter does not.
+    old = page(("paragraph", {"id": "b1"}, [("Alpha", None)]), ("paragraph", {"id": "b2"}, [("Beta", None)]))
+    edit = ydoc.edit_document(old, new_body=page(p("Alpha"), p("Beta, edited")))
+    doc = Doc()
+    doc.apply_update(edit.state)
+    blocks = doc.get(ydoc.BODY, type=XmlFragment).children
+    assert blocks[0].attributes["id"] == "b1"  # kept, not replaced
+    assert str(blocks[1]) == "<paragraph>Beta, edited</paragraph>"
+
+
+def test_append_adds_blocks_and_deletes_nothing():
+    old = page(p("Alpha"), p("Beta"))
+    edit = ydoc.edit_document(old, new_body=page(p("Next")), append=True)
+    assert text_of(edit.state) == "<paragraph>Alpha</paragraph><paragraph>Beta</paragraph><paragraph>Next</paragraph>"
+
+
+def image(src):
+    return ("image-component", {"src": src}, [])
+
+
+def test_removed_parts_names_dropped_or_swapped_images():
+    old = page(p("Alpha"), image("a1"), image("a2"))
+    assert ydoc.removed_parts(old, page(p("Alpha"), image("a1"), image("a2"), p("More"))) == []
+    assert ydoc.removed_parts(old, page(p("Alpha"), image("a1"), image("zz"))) == ["image-component a2"]
+    assert ydoc.removed_parts(old, page(p("Alpha"))) == ["image-component a1", "image-component a2"]
+
+
+def test_missing_from_is_none_for_a_save_that_knows_everything():
+    stored = page(p("Alpha"))
+    editor = Doc()
+    editor.apply_update(stored)
+    text = editor.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")
+    assert ydoc.missing_from(editor.get_update(), stored) is None
+
+
+def test_missing_from_merges_an_api_edit_an_editor_never_received():
+    base = page(p("Alpha"), p("Beta"))
+    editor = Doc()
+    editor.apply_update(base)
+    text = editor.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")  # the editor's save, made without the API edit below
+    stale = editor.get_update()
+    stored = ydoc.edit_document(base, new_body=page(p("Alpha"), p("Beta by AURA"))).state
+    union, missing = ydoc.missing_from(stale, stored)
+    assert text_of(union) == "<paragraph>Alpha typed</paragraph><paragraph>Beta by AURA</paragraph>"
+    editor.apply_update(missing)
+    assert str(editor.get(ydoc.BODY, type=XmlFragment)) == text_of(union)
+
+
+def test_missing_from_catches_a_pure_deletion():
+    base = page(p("Alpha"), p("Beta"))
+    stored = ydoc.edit_document(base, new_body=page(p("Alpha"))).state
+    union, _ = ydoc.missing_from(base, stored)
+    assert text_of(union) == "<paragraph>Alpha</paragraph>"

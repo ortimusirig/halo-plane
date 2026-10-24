@@ -21,18 +21,25 @@ from plane.tests.factories import UserFactory, WorkspaceFactory
 ADMIN, MEMBER, GUEST = 20, 15, 5
 
 
-def doc_for(texts):
-    """Stand-in for live's converter: one paragraph block per text."""
+def doc_for(blocks):
+    """Stand-in for live's converter: a paragraph per text, an image block per ("image", src)."""
     doc = Doc()
     body = doc.get(ydoc.BODY, type=XmlFragment)
     with doc.transaction():
-        for text in texts:
-            body.children.append(XmlElement("paragraph", {})).children.append(XmlText()).insert(0, text)
+        for block in blocks:
+            if isinstance(block, tuple):
+                body.children.append(XmlElement("image-component", {"src": block[1]}))
+            else:
+                body.children.append(XmlElement("paragraph", {})).children.append(XmlText()).insert(0, block)
     return doc.get_update()
 
 
 def paragraphs(html):
-    return re.findall(r"<p>(.*?)</p>", html)
+    """The blocks of simple test HTML: <p>text</p> and <image-component src="..."></image-component>."""
+    blocks = []
+    for text, src in re.findall(r'<p>(.*?)</p>|<image-component src="([^"]*)"', html):
+        blocks.append(("image", src) if src else text)
+    return blocks
 
 
 @contextmanager

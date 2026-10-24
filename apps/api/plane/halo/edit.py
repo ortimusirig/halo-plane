@@ -21,7 +21,7 @@ from plane.db.models import Page
 from plane.utils.content_validator import validate_html_content
 from plane.utils.exception_logger import log_exception
 
-from . import live, versions, ydoc
+from . import lease, live, versions, ydoc
 
 REPUBLISH_AFTER_SECONDS = 3
 
@@ -66,8 +66,23 @@ def _publish(page_id, update: bytes):
         return None
 
 
-def edit_page(page: Page, user, *, expected_updated_at, html=None, name=None) -> dict:
+def _joined_json(old: dict, added: dict) -> dict:
+    """ProseMirror JSON of the old document followed by the added blocks."""
+    return {**(old or {"type": "doc"}), "content": list((old or {}).get("content") or []) + list(added.get("content") or [])}
+
+
+def edit_page(
+    page: Page, user, *, expected_updated_at, html=None, name=None, append=False, allow_removal=False
+) -> dict:
     _check(page, expected_updated_at)
+    try:
+        with lease.edit_lease(page.id):
+            return _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal)
+    except lease.PageBusy:
+        raise EditRefused(409, "edit_in_progress", "Another edit of this page is in progress; try again shortly.")
+
+
+def _edit_leased(page, user, expected_updated_at, html, name, append, allow_removal) -> dict:
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
     clean = new_body = new_json = None
@@ -84,23 +99,40 @@ def edit_page(page: Page, user, *, expected_updated_at, html=None, name=None) ->
             "description_json": page.description_json,
         }
         update = b""
-        if page.description_binary:
-            document = ydoc.edit_document(bytes(page.description_binary), new_body, name)
-            update = document.update
-            body_changed = new_body is not None and ydoc.body_signature(document.state) != ydoc.body_signature(
-                old["description_binary"]
-            )
-            if document.changed:
-                page.description_binary = document.state
+        if html is not None and append:
+            full_html, full_json = old["description_html"] + clean, _joined_json(old["description_json"], new_json)
         else:
-            body_changed = clean is not None and clean != old["description_html"]
+            full_html, full_json = clean, new_json
+        if page.description_binary:
+            current = bytes(page.description_binary)
+            document = ydoc.edit_document(current, new_body, name, append=append)
+            update = document.update
+            body_changed = new_body is not None and ydoc.body_signature(document.state) != ydoc.body_signature(current)
+            before_body, after_body = current, document.state
+        else:
+            # Nobody has opened the page yet, so there is no document: live builds it from the HTML on first open.
+            body_changed = html is not None and full_html != old["description_html"]
+            before_body = live.convert_html(old["description_html"])[0] if body_changed and not append else None
+            after_body = new_body
+        if body_changed and not append and not allow_removal:
+            lost = ydoc.removed_parts(before_body, after_body)
+            if lost:
+                raise EditRefused(
+                    400, "would_remove_parts",
+                    "This edit would remove " + "; ".join(lost) + ". Keep them as they are, or, if the person "
+                    "agreed to remove them, send allow_removal.",
+                )
         name_changed = name is not None and name != page.name
         if not (body_changed or name_changed):
             return {"changed": False, "before_version_id": None, "after_version_id": None, "open_editors_updated": 0}
         if body_changed:
-            page.description_html, page.description_json = clean, new_json
+            page.description_html, page.description_json = full_html, full_json
+            if page.description_binary:
+                page.description_binary = document.state
         if name_changed:
             page.name = name
+            if page.description_binary and document.changed:
+                page.description_binary = document.state
         page.save()
         before = after = None
         if body_changed:
@@ -115,7 +147,7 @@ def edit_page(page: Page, user, *, expected_updated_at, html=None, name=None) ->
     if body_changed:
         try:
             page_transaction.delay(
-                new_description_html=clean, old_description_html=old["description_html"], page_id=page.id
+                new_description_html=full_html, old_description_html=old["description_html"], page_id=page.id
             )
         except Exception as error:  # the mentions index only; the edit itself is saved
             log_exception(error)

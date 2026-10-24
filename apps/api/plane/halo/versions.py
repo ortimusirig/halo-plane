@@ -4,9 +4,9 @@
 
 """Versions for one API edit, in Plane's own version history (page_versions).
 
-Plane merges a person's saves within ten minutes into their newest version (bgtasks/page_version_task.py).
-The "before" version of an edit is therefore written older than its "after" version, so later saves merge into
-"after" and the content before the edit stays restorable from Halo's version panel.
+Plane merges a person's saves within ten minutes into their newest version (bgtasks/page_version_task.py). Both
+versions of an API edit are marked (sub_pages_data, unused by Plane CE), and Halo's version task never merges a
+save into a marked version, so the text before and after each API edit stays restorable from Halo.
 """
 
 from datetime import timedelta
@@ -16,6 +16,7 @@ from django.utils import timezone
 from plane.db.models import PageVersion
 
 MAX_VERSIONS = 20  # Plane's own limit (bgtasks/page_version_task.py)
+MARK = {"halo_api_edit": True}
 
 
 def _version(page, user_id, saved_at, html, binary, json_data):
@@ -27,6 +28,7 @@ def _version(page, user_id, saved_at, html, binary, json_data):
         description_html=html,
         description_binary=binary,
         description_json=json_data or {},
+        sub_pages_data=dict(MARK),
     )
 
 

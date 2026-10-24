@@ -34,3 +34,24 @@ def test_saves_within_ten_minutes_merge_into_one_version(world):
         page.save()
         track_page_version(page_id=page.id, existing_instance=old, user_id=world.owner.user.id)
     assert list(PageVersion.objects.filter(page=page).values_list("description_html", flat=True)) == ["<p>two</p>"]
+
+
+@pytest.mark.django_db
+def test_a_save_is_never_merged_into_an_api_edit_version(world):
+    from django.utils import timezone
+
+    page = world.public
+    PageVersion.objects.create(
+        page=page,
+        workspace=page.workspace,
+        owned_by=world.owner.user,
+        last_saved_at=timezone.now(),
+        description_html=page.description_html,
+        sub_pages_data={"halo_api_edit": True},
+    )
+    old = json.dumps({"description_html": page.description_html})
+    page.description_html = "<p>Typed after the API edit</p>"
+    page.save()
+    track_page_version(page_id=page.id, existing_instance=old, user_id=world.owner.user.id)
+    texts = set(PageVersion.objects.filter(page=page).values_list("description_html", flat=True))
+    assert texts == {"<p>Alpha</p><p>Beta</p><p>Gamma</p>", "<p>Typed after the API edit</p>"}

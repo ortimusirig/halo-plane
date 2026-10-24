@@ -8,8 +8,7 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 
-PLANE_TAG=v1.4.2
-HALO_TAG=halo-v1.4.2-pages.1
+. halo/release.env
 image=${1:-plane-backend-halo:v1.4.2-pages.1}
 
 if ! git diff --quiet HEAD -- apps/api || [ -n "$(git ls-files --others --exclude-standard apps/api)" ]; then

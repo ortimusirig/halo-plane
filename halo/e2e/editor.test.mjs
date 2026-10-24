@@ -88,7 +88,9 @@ function inApi(code) {
 }
 
 const page = async (id) => (await api("GET", `pages/${id}/`)).data;
-const closed = async (id) => (await page(id)).is_open === false;
+// Whether live still holds the page, asked the way the API asks before an edit.
+const closed = async (id) =>
+  inApi(`from plane.halo import live; print(live.is_open("${id}"))`).split(/\r?\n/).pop() === "False";
 
 async function versionTexts(id) {
   const list = (await api("GET", `pages/${id}/versions/`)).data ?? [];
@@ -186,6 +188,9 @@ const reached = inApi(
 const pushed = await waitFor(() => blocks(docB)[2] === "Gamma pushed", 5000);
 check("9 published update reaches the open editor", reached.endsWith("1") && Boolean(pushed),
   `receivers=${reached} blocks=${JSON.stringify(blocks(docB))}`);
+const archivedOpen = await api("POST", `pages/${pageId}/archive/`);
+check("9b archive refused while the page is open", archivedOpen.status === 409 && archivedOpen.data.code === "page_open",
+  JSON.stringify(archivedOpen));
 closeEditor(editorB);
 
 // 10. Undo through the API: the before version's HTML applied the same safe way.
