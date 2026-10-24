@@ -1,7 +1,7 @@
 # Halo changes to Plane Community Edition
 
 Halo (https://pm.applexus.net) is Applexus' self-hosted Plane Community Edition. This branch
-(`halo/pages-api`) is Plane CE `v1.4.2` (commit `5f7d927`, see `halo/release.env`) plus the changes listed
+(`halo/pages-api`) is Plane CE `v1.4.2` (commit `5f7d927`, see `halo/release.conf`) plus the changes listed
 here. Plane is licensed under the GNU Affero General Public License v3.0 only (see `LICENSE.txt`); these
 changes are under the same licence. Plane's copyright notices are unchanged; every file Applexus added says
 so in its header. No code from Plane's paid editions is used.
@@ -132,14 +132,15 @@ stays the upstream image; the API reaches it at `HALO_LIVE_URL` (default `http:/
 
 ## Upgrade
 
-Halo runs one release behind Plane's newest and never downgrades. For a new Plane tag run
-`bash halo/upgrade-check.sh <tag>`, the release gate: it checks the patch against the new tag, builds the
+Halo runs one release behind Plane's newest and never downgrades: the gate refuses a release candidate,
+Plane's newest release and any tag not newer than the deployed one (`halo/release_order.py`). For a new
+Plane tag run `bash halo/upgrade-check.sh <tag>`, the release gate: it checks the patch against the new tag, builds the
 image on the new upstream image, runs the Halo tests and the end-to-end test with the new live image, and
 reports what needs a decision (the version bug fixed upstream, Plane's own API page routes, a changed
 description or duplicate endpoint, a changed copy task, a changed Hocuspocus or converter). It passes only for a
-candidate branch built on the new tag (the tag in its history, not only in its `release.env`) whose `HALO_TAG` is
+candidate branch built on the new tag (the tag in its history, not only in its `release.conf`) whose `HALO_TAG` is
 tagged on the candidate's commit, so the image and its published source are the same tree; and it fails a patch
-that changes Plane files beyond `apps/api/plane/halo/` and the list in `release.env` (`PATCH_PLANE_FILES`).
+that changes Plane files beyond `apps/api/plane/halo/` and the list in `release.conf` (`PATCH_PLANE_FILES`).
 `--check-only` gives the report without building; it is not a gate.
 
 ## Rollback

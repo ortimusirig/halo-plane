@@ -3,29 +3,33 @@
 #
 #   bash halo/upgrade-check.sh <new tag> [--candidate <branch>] [--check-only]
 #
-# Run it from the deployed branch: its halo/release.env names the release Halo runs (PLANE_TAG). The candidate
+# Run it from the deployed branch: its halo/release.conf names the release Halo runs (PLANE_TAG). The candidate
 # is the branch to ship (default: this one). When the patch does not apply to the new tag, make a candidate:
-# a branch from the new tag with the Halo commits rebased onto it and its own halo/release.env set to the new
+# a branch from the new tag with the Halo commits rebased onto it and its own halo/release.conf set to the new
 # tag; then run the gate again with --candidate <that branch>. The candidate's patch is always its diff from its
 # own base.
 #
 # Only a candidate built on the new tag can pass: the image is the new upstream image with the patch, so its
-# published source (the HALO_TAG of the candidate's release.env) must be that same tree. The gate therefore needs
-# the candidate's release.env to name the new tag and a new HALO_TAG, and that tag to exist (locally) on the
+# published source (the HALO_TAG of the candidate's release.conf) must be that same tree. The gate therefore needs
+# the candidate's release.conf to name the new tag and a new HALO_TAG, and that tag to exist (locally) on the
 # candidate's commit; push the tag only after the gate passed. Running the deployed branch against a new tag is
 # still useful as a first look: the report then shows the candidate item OPEN.
 #
-# Halo runs one release behind Plane's newest and never downgrades: the new tag must be newer than the deployed
-# release (semantic order: v1.4.3-rc1 < v1.4.3). The gate checks the patch against the new tag, builds the image
-# on the new upstream image, runs the Halo tests, Plane's own tests (no new failures against the upstream image)
-# and the end-to-end test with the new live image. It passes only when all of that passes and no compatibility
+# Halo runs one release behind Plane's newest and never downgrades (halo/release_order.py): the new tag must be
+# newer than the deployed release (semantic order: v1.4.3-rc1 < v1.4.3), a release rather than a release
+# candidate, and already followed by a newer Plane release. The gate refuses any other target before building;
+# --check-only reports it as an open item, so a coming release can be checked early.
+#
+# The gate checks the patch against the new tag, builds the image on the new upstream image, runs the Halo
+# tests, Plane's own tests (no new failures against the upstream image) and the end-to-end test with the new
+# live image. It passes only when all of that passes and no compatibility
 # item is open. --check-only gives the report without building or testing; it is not a gate. Nothing here
 # changes a branch or a deployment.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
-# shellcheck source=release.env
-. halo/release.env
+# shellcheck source=release.conf
+. halo/release.conf
 # The release Halo runs: this checkout's base, or the deployed branch's when this run is inside a candidate.
 deployed=${HALO_DEPLOYED_TAG:-$PLANE_TAG}
 
@@ -63,27 +67,34 @@ if ! git diff --quiet HEAD -- apps/api halo || [ -n "$(git ls-files --others --e
 fi
 
 py=$(command -v python3 || command -v python)
-newer=$("$py" -c '
-import re, sys
-def key(tag):
-    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?", tag)
-    if not match:
-        sys.exit("not a Plane release tag: " + tag)
-    major, minor, patch, rc = match.groups()
-    return (int(major), int(minor), int(patch), int(rc) if rc else float("inf"))
-print("yes" if key(sys.argv[2]) > key(sys.argv[1]) else "no")
-' "$deployed" "$new")
-if [ "$newer" != "yes" ]; then
-  echo "FAIL: $new is not newer than the deployed $deployed (Halo never downgrades)"
+# Release order (halo/release_order.py): never a downgrade, and n-1, a release Plane has already followed with
+# a newer one. Plane's published tags come from the upstream remote.
+published=$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/##')
+set +e
+# shellcheck disable=SC2086  # one argument per tag
+order=$("$py" halo/release_order.py "$deployed" "$new" $published)
+order_code=$?
+set -e
+if [ "$order_code" != 0 ] && [ "$order_code" != 2 ]; then
+  echo "FAIL: $order"
   exit 1
 fi
-candidate_base=$(git show "$candidate:halo/release.env" | sed -n 's/^PLANE_TAG=//p')
+candidate_base=$(git show "$candidate:halo/release.conf" | sed -n 's/^PLANE_TAG=//p')
 if [ "$candidate_base" != "$deployed" ] && [ "$candidate_base" != "$new" ]; then
   echo "FAIL: candidate $candidate is built on $candidate_base, neither the deployed $deployed nor $new"
   exit 1
 fi
 echo "deployed $deployed, new $new, candidate $candidate (based on $candidate_base)"
 open_items=0
+if [ "$order_code" = 0 ]; then
+  echo "OK   release order: $order"
+elif [ "$mode" = check ]; then
+  echo "OPEN release order (n-1): $order"
+  open_items=$((open_items + 1))
+else
+  echo "FAIL release order (n-1): $order"
+  exit 1
+fi
 if [ "$candidate_base" = "$new" ]; then
   echo "OK   candidate is built on $new"
 else
@@ -107,13 +118,13 @@ trap 'git worktree remove --force "$work"' EXIT
 git diff --binary "$candidate_base" "$candidate" -- apps/api > "$work/halo.patch"
 
 failures=0
-# The patch is the candidate's diff from the tag its release.env names, so that tag must be in its history
+# The patch is the candidate's diff from the tag its release.conf names, so that tag must be in its history
 # (a relabelled, not rebased branch would diff in reversions of every upstream change), and the diff may touch
-# only Halo's own app and the Plane files Halo changes (PATCH_PLANE_FILES in release.env).
+# only Halo's own app and the Plane files Halo changes (PATCH_PLANE_FILES in release.conf).
 if git merge-base --is-ancestor "$candidate_base" "$candidate"; then
   echo "OK   candidate's history contains $candidate_base"
 else
-  echo "FAIL candidate is not built on $candidate_base: its release.env says so, but the tag is not in its history"
+  echo "FAIL candidate is not built on $candidate_base: its release.conf says so, but the tag is not in its history"
   failures=$((failures + 1))
 fi
 outside=$(git diff --name-only "$candidate_base" "$candidate" -- apps/api | while read -r path; do
@@ -168,7 +179,7 @@ mirrored() {  # <class name> <expected fingerprint> <route suffix> <Halo class>:
     && grep -qF "/pages/<uuid:page_id>/$3/" "$work/apps/api/plane/app/urls/page.py"; then
     echo "OK   Plane's $1 is unchanged (Halo's $4 mirrors it)"
   else
-    echo "OPEN Plane's $1 changed ($found): port the change to $4 in plane/halo/views.py and update release.env"
+    echo "OPEN Plane's $1 changed ($found): port the change to $4 in plane/halo/views.py and update release.conf"
     open_items=$((open_items + 1))
   fi
 }

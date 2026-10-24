@@ -813,3 +813,21 @@ def test_duplicate_without_a_broker_leaves_the_copy_usable(world, api_client):
         response = api_client.post(_app_page_url(world, "duplicate/"))
     assert response.status_code == 201, response.content
     assert not PageBeingCopied.objects.filter(page_id=response.json()["id"]).exists()
+
+
+
+@pytest.mark.parametrize("value", [123, ["<p>x</p>"], {"html": "<p>x</p>"}])
+def test_create_refuses_html_that_is_not_text(world, value):
+    pages = Page.objects.count()
+    response = world.owner.client.post(world.base, {"name": "New", "description_html": value}, format="json")
+    assert (response.status_code, response.json()["code"]) == (400, "invalid_field")
+    assert Page.objects.count() == pages
+
+
+def test_a_save_of_empty_html_alone_marks_the_text_as_behind(world, api_client):
+    """Plane's serializer writes an empty description_html too, while the document stays."""
+    from plane.halo.models import PageTextBehind
+
+    api_client.force_authenticate(user=world.owner.user)
+    assert api_client.patch(_description_url(world), {"description_html": ""}, format="json").status_code == 200
+    assert PageTextBehind.objects.filter(page_id=world.public.id).exists()

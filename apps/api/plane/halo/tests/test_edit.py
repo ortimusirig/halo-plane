@@ -247,3 +247,29 @@ def test_appends_cannot_grow_a_page_past_plane_s_limit(world, fake_live):
             _edit(world, html="<p>" + "x" * 30 + "</p>", append=True)
     assert (refused.value.status, refused.value.code) == (400, "page_too_large")
     assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
+
+
+
+def _texts(json_data):
+    return [block["content"][0]["text"] for block in json_data.get("content", [])]
+
+
+@pytest.mark.django_db
+def test_restoring_an_html_only_version_keeps_the_converted_json(world, fake_live):
+    """Older versions have HTML only; the document and the JSON both come from converting it, so a later
+    append joins the whole page's JSON, not the added blocks alone."""
+    version = PageVersion.objects.create(page=world.public, workspace=world.workspace, owned_by=world.owner.user,
+                                         description_html="<p>Old</p><p>Text</p>", description_json={})
+    _edit(world, restore_from=version)
+    assert _texts(Page.objects.get(pk=world.public.pk).description_json) == ["Old", "Text"]
+    _edit(world, html="<p>Added</p>", append=True)
+    assert _texts(Page.objects.get(pk=world.public.pk).description_json) == ["Old", "Text", "Added"]
+
+
+@pytest.mark.django_db
+def test_an_append_to_a_page_with_unknown_json_does_not_claim_the_added_blocks_are_the_page(world, fake_live):
+    Page.objects.filter(pk=world.public.pk).update(description_json={})
+    _edit(world, html="<p>Added</p>", append=True)
+    page = Page.objects.get(pk=world.public.pk)
+    assert page.description_json == {}  # Plane's version viewer then shows the HTML
+    assert page.description_html == ORIGINAL + "<p>Added</p>"

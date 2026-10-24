@@ -100,8 +100,12 @@ def _publish(page_id, update: bytes):
 
 
 def _joined_json(old: dict, added: dict) -> dict:
-    """ProseMirror JSON of the old document followed by the added blocks."""
-    return {**(old or {"type": "doc"}), "content": list((old or {}).get("content") or []) + list(added.get("content") or [])}
+    """ProseMirror JSON of the old document followed by the added blocks; empty when the old JSON is unknown
+    (some stored pages and versions have none), since the added blocks alone would claim to be the whole page.
+    Plane's version viewer then shows the HTML."""
+    if "content" not in (old or {}):
+        return {}
+    return {**old, "content": list(old["content"] or []) + list(added.get("content") or [])}
 
 
 def edit_page(
@@ -174,11 +178,13 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
     if restore_from is not None:
         # The version's own document, not its HTML: nothing in it passes through the sanitizer or converter.
         clean = restore_from.description_html or "<p></p>"
-        new_json = restore_from.description_json or {}
         if restore_from.description_binary:
             new_body = bytes(restore_from.description_binary)
+            new_json = restore_from.description_json or {}
         else:
-            new_body = _convert(clean)[0]
+            # Older versions keep HTML only: the document and its JSON come from converting it, together.
+            new_body, converted_json = _convert(clean)
+            new_json = restore_from.description_json or converted_json
         html, append, allow_removal = clean, False, True  # an undo may remove what came after the version
     elif html is not None:
         clean = sanitize(html) or "<p></p>"

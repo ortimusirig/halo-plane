@@ -242,3 +242,25 @@ def test_long_repetitive_text_is_diffed_quickly_and_correctly():
         edit = ydoc.edit_document(old, new_body=page(p(new_text)))
         assert time.monotonic() - started < 3
         assert ydoc.body_signature(edit.state) == ydoc.body_signature(page(p(new_text)))
+
+
+def _runs(binary):
+    doc = Doc()
+    doc.apply_update(binary)
+    return doc.get(ydoc.BODY, type=XmlFragment).children[0].children[0].diff()
+
+
+def test_formatting_removed_inside_a_formatted_run_is_removed():
+    """Inserted text takes no formatting from its neighbours (pycrdt writes the attributes explicitly)."""
+    both = {"bold": {}, "italic": {}}
+    cases = [
+        ([("abc", {"bold": {}})], [("a", {"bold": {}}), ("b", None), ("c", {"bold": {}})]),
+        ([("abc", both)], [("a", both), ("b", {"italic": {}}), ("c", both)]),
+        ([("abc", both)], [("ab", both), ("c", None)]),
+        ([("abc", None)], [("a", None), ("b", {"bold": {}}), ("c", None)]),
+    ]
+    for old_runs, new_runs in cases:
+        old, new = page(("paragraph", {}, old_runs)), page(("paragraph", {}, new_runs))
+        edit = ydoc.edit_document(old, new_body=new)
+        assert edit.changed, new_runs
+        assert _runs(edit.state) == _runs(new), new_runs

@@ -58,7 +58,7 @@ git -C "$scratch" checkout -q -- halo/requirements-halo.txt
 touch "$scratch/halo/extra-input.txt"
 expect "build refuses an untracked file in halo/" 1 "uncommitted changes" "${nodocker[@]}" bash "$scratch/halo/build-backend.sh"
 
-relabelled=$(commit_with halo/release.env "s/^PLANE_TAG=.*/PLANE_TAG=$new/")
+relabelled=$(commit_with halo/release.conf "s/^PLANE_TAG=.*/PLANE_TAG=$new/")
 expect "gate fails a branch relabelled to $new but not rebased" 1 "is not built on $new" \
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --candidate "$relabelled" --check-only
 outside=$(commit_with apps/api/plane/app/views/page/base.py '$a # changed outside Halo')
@@ -66,6 +66,21 @@ expect "gate fails a patch outside Halo's files" 1 "apps/api/plane/app/views/pag
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --candidate "$outside" --check-only
 expect "this branch passes the gate's checks" 0 "CHECK ONLY: 0 failed" \
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --check-only
+expect "the gate refuses a release candidate before building" 1 "FAIL release order (n-1)" \
+  "${nodocker[@]}" bash halo/upgrade-check.sh "$new"
+
+# The release rule itself, on made-up tag lists (deployed, target, published tags).
+py=$(command -v python3 || command -v python)
+order() { "$py" halo/release_order.py "$@"; }
+expect "n-1: the newest release is refused" 2 "newest release" order v1.4.2 v1.4.4 v1.4.2 v1.4.3 v1.4.4
+expect "n-1: a release with a newer one out is allowed" 0 "behind Plane's newest release v1.4.4" \
+  order v1.4.2 v1.4.3 v1.4.2 v1.4.3 v1.4.4
+expect "n-1: two releases behind is allowed" 0 "behind Plane's newest release v1.5.1" \
+  order v1.4.2 v1.5.0 v1.4.3 v1.5.0 v1.5.1 v1.6.0-rc1
+expect "n-1: a release candidate is refused" 2 "release candidate" order v1.4.2 v1.4.3-rc2 v1.4.3-rc2 v1.4.4
+expect "no downgrade" 1 "never downgrades" order v1.4.2 v1.4.1 v1.4.1 v1.4.2 v1.4.3
+expect "no same release" 1 "never downgrades" order v1.4.2 v1.4.2 v1.4.2 v1.4.3
+expect "a malformed tag is refused" 64 "not a Plane release tag" order v1.4.2 latest v1.4.3
 
 echo "${failures} failed"
 [ "$failures" = 0 ]

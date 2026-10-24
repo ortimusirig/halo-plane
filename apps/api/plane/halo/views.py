@@ -125,6 +125,8 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
                 "Halo's API creates a page from name, description_html and access only, not: " + ", ".join(unknown),
                 "unsupported_field",
             )
+        if not isinstance(request.data.get("description_html") or "", str):
+            return _error("description_html must be text.", "invalid_field")
         if not Project.objects.filter(pk=project_id, workspace__slug=slug, archived_at__isnull=True).exists():
             # Plane's page list and reads leave archived projects out (PageViewSet.get_queryset); creating a page
             # there would commit a page the answer could not show.
@@ -418,11 +420,14 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             if not serializer.is_valid():
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             serializer.save()
-            if merged or bool(encoded) != bool(data.get("description_html")):
+            # What was written, as Plane's serializer saw it (an empty value is written too).
+            html_saved = "description_html" in serializer.validated_data
+            document_saved = "description_binary" in serializer.validated_data
+            if merged or html_saved != document_saved:
                 # The stored HTML and document disagree (a merged save, or a save of only one of them): marked
                 # until a complete save, of both the whole document and its HTML.
                 PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
-            elif encoded:
+            elif document_saved:
                 PageTextBehind.objects.filter(page_id=page.pk).delete()
             if data.get("description_html"):
                 new_html = data["description_html"]

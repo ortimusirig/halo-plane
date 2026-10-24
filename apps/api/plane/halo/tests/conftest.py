@@ -35,6 +35,15 @@ def doc_for(blocks):
     return doc.get_update()
 
 
+def json_for(blocks):
+    """Stand-in for live's ProseMirror JSON of the same blocks."""
+    return {"type": "doc", "content": [
+        {"type": "imageComponent", "attrs": {"src": block[1]}} if isinstance(block, tuple)
+        else {"type": "paragraph", "content": [{"type": "text", "text": block}]}
+        for block in blocks
+    ]}
+
+
 def paragraphs(html):
     """The blocks of simple test HTML: <p>text</p> and <image-component src="..."></image-component>."""
     blocks = []
@@ -100,7 +109,7 @@ def fake_live():
             raise LiveUnavailable("live is down")
         if state.too_large:
             raise LiveTooLarge("over 100 kB")
-        return doc_for(paragraphs(html)), {"type": "doc"}
+        return doc_for(paragraphs(html)), json_for(paragraphs(html))
 
     with patch("plane.halo.live.convert_html", side_effect=convert):
         yield state

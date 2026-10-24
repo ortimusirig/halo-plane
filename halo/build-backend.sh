@@ -9,7 +9,7 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 
-. halo/release.env
+. halo/release.conf
 image=${1:-plane-backend-halo:v1.4.2-pages.1}
 
 if ! git diff --quiet HEAD -- apps/api halo || [ -n "$(git ls-files --others --exclude-standard apps/api halo)" ]; then
