@@ -1,0 +1,12 @@
+{
+  "name": "halo-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Halo page edit end-to-end test: a Node Hocuspocus client acts as the browser editor.",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@hocuspocus/provider": "2.15.2",
+    "ws": "8.18.3",
+    "yjs": "13.6.27"
+  }
+}

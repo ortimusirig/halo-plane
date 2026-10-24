@@ -1,0 +1,72 @@
+# Halo page edit end-to-end test: the Halo backend image with Plane's real live service.
+# Started by halo/e2e/run.sh; nothing here is for production (fixed test secrets, no TLS, no S3).
+name: halo-e2e
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://plane:plane@plane-db:5432/plane
+  REDIS_URL: redis://plane-redis:6379/
+  AMQP_URL: amqp://plane:plane@plane-mq:5672/plane
+  SECRET_KEY: halo-e2e-secret-key-for-tests-only-0123456789abcdef
+  LIVE_SERVER_SECRET_KEY: halo-e2e-live-secret
+  WEB_URL: http://localhost
+  DEBUG: "0"
+  GUNICORN_WORKERS: "1"
+  HALO_LIVE_URL: http://live:3000/live/
+
+x-backend: &backend
+  image: ${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.1}
+  environment: *app-env
+
+services:
+  plane-db:
+    image: postgres:15.7-alpine
+    environment:
+      POSTGRES_USER: plane
+      POSTGRES_PASSWORD: plane
+      POSTGRES_DB: plane
+
+  plane-redis:
+    image: valkey/valkey:7.2.11-alpine
+
+  plane-mq:
+    image: rabbitmq:3.13.6-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: plane
+      RABBITMQ_DEFAULT_PASS: plane
+      RABBITMQ_DEFAULT_VHOST: plane
+
+  migrator:
+    <<: *backend
+    command: ./bin/docker-entrypoint-migrator.sh
+    depends_on: [plane-db, plane-redis]
+
+  api:
+    <<: *backend
+    # Plane's API entrypoint without create_bucket and collectstatic (no S3 in this test).
+    command:
+      - sh
+      - -c
+      - >-
+        python manage.py wait_for_db && python manage.py wait_for_migrations &&
+        python manage.py register_instance halo-e2e && python manage.py configure_instance &&
+        exec gunicorn -w 1 -k uvicorn.workers.UvicornWorker plane.asgi:application --bind 0.0.0.0:8000
+    ports: ["127.0.0.1:18000:8000"]
+    depends_on:
+      migrator: {condition: service_completed_successfully}
+      plane-mq: {condition: service_started}
+
+  worker:
+    <<: *backend
+    command: ./bin/docker-entrypoint-worker.sh
+    depends_on:
+      migrator: {condition: service_completed_successfully}
+      plane-mq: {condition: service_started}
+
+  live:
+    image: makeplane/plane-live:v1.4.2
+    environment:
+      API_BASE_URL: http://api:8000
+      REDIS_URL: redis://plane-redis:6379/
+      LIVE_SERVER_SECRET_KEY: halo-e2e-live-secret
+    ports: ["127.0.0.1:13000:3000"]
+    depends_on: [api, plane-redis]
