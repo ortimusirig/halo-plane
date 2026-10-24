@@ -75,3 +75,5 @@ opentelemetry-exporter-otlp-proto-grpc==1.28.1
 drf-spectacular==0.29.0
 # html sanitizer
 nh3==0.2.18
+# Halo (Applexus): Yjs document edits for the page API (plane/halo)
+pycrdt==0.14.8

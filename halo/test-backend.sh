@@ -5,6 +5,7 @@
 #
 # Without --dev it tests the built image plane-backend-halo:v1.4.2-pages.1 (halo/build-backend.sh).
 # --dev tests the working tree instead: apps/api/plane is mounted over the upstream image's code.
+# --upstream tests the unpatched upstream image (a baseline for Plane's own tests).
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
@@ -16,6 +17,9 @@ if [ "${1:-}" = "--dev" ]; then
   shift
   base=makeplane/plane-backend:v1.4.2
   mount=(-v "$root/apps/api/plane:/code/plane:ro")
+elif [ "${1:-}" = "--upstream" ]; then
+  shift
+  base=makeplane/plane-backend:v1.4.2
 fi
 [ $# -gt 0 ] || set -- plane/halo/tests
 

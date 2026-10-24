@@ -15,6 +15,9 @@ from .work_item import urlpatterns as work_item_patterns
 from .invite import urlpatterns as invite_patterns
 from .sticky import urlpatterns as sticky_patterns
 
+# Halo (Applexus): project page routes in plane/halo. Drop them when Plane CE ships its own.
+from plane.halo.urls import urlpatterns as halo_page_patterns
+
 urlpatterns = [
     *asset_patterns,
     *cycle_patterns,
@@ -28,4 +31,5 @@ urlpatterns = [
     *work_item_patterns,
     *invite_patterns,
     *sticky_patterns,
+    *halo_page_patterns,
 ]
