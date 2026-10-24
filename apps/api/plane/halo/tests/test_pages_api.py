@@ -5,8 +5,7 @@
 import pytest
 
 from plane.db.models import Page, Project
-from plane.halo import live
-from plane.settings.redis import redis_instance
+from plane.halo.tests.conftest import live_channel
 
 pytestmark = pytest.mark.django_db
 
@@ -98,14 +97,9 @@ def test_edit_returns_versions_and_links(world, fake_live):
 
 def test_edit_refusals_have_codes(world, fake_live):
     url = f"{world.base}{world.public.id}/"
-    pubsub = redis_instance().pubsub()
-    pubsub.subscribe(live.channel(world.public.id))
-    try:
-        pubsub.get_message(timeout=2)
+    with live_channel(world.public.id):
         response = world.member.client.patch(url, {"description_html": "<p>x</p>"}, format="json")
         assert world.member.client.get(url).json()["is_open"] is True
-    finally:
-        pubsub.close()
     assert (response.status_code, response.json()["code"]) == (409, "page_open")
     stale = world.member.client.patch(
         url, {"description_html": "<p>x</p>", "expected_updated_at": "2020-01-01T00:00:00Z"}, format="json"

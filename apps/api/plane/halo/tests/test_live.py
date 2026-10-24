@@ -9,6 +9,7 @@ import pytest
 import requests
 
 from plane.halo import live
+from plane.halo.tests.conftest import live_channel
 from plane.settings.redis import redis_instance
 
 PAGE = "3f2b1c4d-0000-4000-8000-000000000001"
@@ -29,13 +30,32 @@ def test_long_update_length_is_a_var_uint():
     assert tail[2:] == b"x" * 300
 
 
-def test_is_open_follows_a_subscriber_on_the_page_channel():
+def test_query_message_asks_live_for_the_page_awareness():
+    name = PAGE.encode()
+    assert live.query_awareness_message(PAGE) == bytes([8]) + b"halo-api" + bytes([len(name)]) + name + bytes([3])
+
+
+def test_page_without_a_live_subscriber_is_closed_at_once():
     assert live.is_open(PAGE) is False
-    pubsub = redis_instance().pubsub()
+
+
+def test_page_held_by_live_is_open():
+    with live_channel(PAGE):
+        assert live.is_open(PAGE) is True
+
+
+def test_page_live_no_longer_holds_is_closed_although_subscribed():
+    # live keeps the channel subscribed after the last editor leaves; only an answer counts.
+    with live_channel(PAGE, holds_page=False):
+        assert redis_instance().pubsub_numsub(live.channel(PAGE))[0][1] >= 1
+        assert live.is_open(PAGE) is False
+
+
+def test_publish_update_reaches_the_channel():
+    pubsub = redis_instance().pubsub(ignore_subscribe_messages=True)
     pubsub.subscribe(live.channel(PAGE))
     try:
-        pubsub.get_message(timeout=2)  # the subscribe confirmation
-        assert live.is_open(PAGE) is True
+        pubsub.get_message(timeout=1)
         assert live.publish_update(PAGE, b"\x00") == 1
         message = pubsub.get_message(timeout=2)
         assert message["data"] == live.sync_update_message(PAGE, b"\x00")

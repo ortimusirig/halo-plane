@@ -5,12 +5,14 @@
 """Halo's live service (Plane's collaborative editor server), reached the ways Plane itself uses.
 
 convert_html calls live's own converter, as Plane's copy_s3_object task does. Live keeps an open page in memory
-and listens on the Redis channel hocuspocus:<page_id> while it is open (@hocuspocus/extension-redis 2.15.2,
-default prefix). A sync update published there reaches every open editor of the page.
+and talks to other live servers on the Redis channel hocuspocus:<page_id> (@hocuspocus/extension-redis 2.15.2,
+default prefix): a sync update published there reaches every open editor of the page, and a server that holds
+the page answers an awareness query.
 """
 
 import base64
 import os
+import time
 from urllib.parse import urljoin
 
 import redis
@@ -23,6 +25,8 @@ CHANNEL_PREFIX = "hocuspocus"
 IDENTIFIER = b"halo-api"  # live skips only messages that carry its own identifier
 SYNC = 0  # Hocuspocus MessageType.Sync
 YJS_UPDATE = 2  # y-protocols messageYjsUpdate
+QUERY_AWARENESS = 3  # Hocuspocus MessageType.QueryAwareness
+PROBE_SECONDS = float(os.environ.get("HALO_LIVE_PROBE_SECONDS", "0.5"))
 
 
 class LiveUnavailable(Exception):
@@ -50,11 +54,35 @@ def channel(page_id) -> str:
 
 
 def is_open(page_id) -> bool:
-    """True while a live server holds the page, that is while someone has it open in Halo."""
+    """True while a live server holds the page, that is while someone has it open in Halo.
+
+    Live stays subscribed to a page's channel after the page closes (the extension unsubscribes only when the
+    page is still in memory a second after the last editor leaves), so a subscriber count only says "never
+    opened since live started". A server that holds the page answers an awareness query; one that does not
+    stays silent, so silence for PROBE_SECONDS means closed.
+    """
+    client = redis_instance()
+    pubsub = client.pubsub(ignore_subscribe_messages=True)
     try:
-        return any(count for _, count in redis_instance().pubsub_numsub(channel(page_id)))
+        if not any(count for _, count in client.pubsub_numsub(channel(page_id))):
+            return False
+        pubsub.subscribe(channel(page_id))
+        pubsub.get_message(timeout=1)  # the subscribe confirmation, before asking
+        client.publish(channel(page_id), query_awareness_message(page_id))
+        deadline = time.monotonic() + PROBE_SECONDS
+        while (left := deadline - time.monotonic()) > 0:
+            message = pubsub.get_message(timeout=left)
+            if message and message["type"] == "message" and not _from_us(message["data"]):
+                return True
+        return False
     except redis.RedisError as error:
         raise LiveUnavailable(str(error)) from error
+    finally:
+        pubsub.close()
+
+
+def _from_us(data: bytes) -> bool:
+    return data[1 : 1 + data[0]] == IDENTIFIER if data else False
 
 
 def _var_uint(number: int) -> bytes:
@@ -73,9 +101,16 @@ def _var_bytes(data: bytes) -> bytes:
     return _var_uint(len(data)) + data
 
 
+def _message(page_id, body: bytes) -> bytes:
+    return bytes([len(IDENTIFIER)]) + IDENTIFIER + _var_bytes(str(page_id).encode()) + body
+
+
 def sync_update_message(page_id, update: bytes) -> bytes:
-    body = _var_bytes(str(page_id).encode()) + _var_uint(SYNC) + _var_uint(YJS_UPDATE) + _var_bytes(update)
-    return bytes([len(IDENTIFIER)]) + IDENTIFIER + body
+    return _message(page_id, _var_uint(SYNC) + _var_uint(YJS_UPDATE) + _var_bytes(update))
+
+
+def query_awareness_message(page_id) -> bytes:
+    return _message(page_id, _var_uint(QUERY_AWARENESS))
 
 
 def publish_update(page_id, update: bytes) -> int:

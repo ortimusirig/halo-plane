@@ -3,6 +3,8 @@
 # See the LICENSE file for details.
 
 import re
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -31,6 +33,38 @@ def doc_for(texts):
 
 def paragraphs(html):
     return re.findall(r"<p>(.*?)</p>", html)
+
+
+@contextmanager
+def live_channel(page_id, holds_page=True):
+    """A stand-in live server on the page's Redis channel.
+
+    Like live (@hocuspocus/extension-redis 2.15.2) it stays subscribed after a page closes; it answers a
+    query from another server only while it holds the page (holds_page=True).
+    """
+    from plane.halo import live
+
+    identity = b"live-test"
+    pubsub = redis_instance().pubsub(ignore_subscribe_messages=True)
+    pubsub.subscribe(live.channel(page_id))
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            message = pubsub.get_message(timeout=0.05)
+            if message and holds_page and message["data"][1 : 1 + message["data"][0]] != identity:
+                name = str(page_id).encode()
+                reply = bytes([len(identity)]) + identity + bytes([len(name)]) + name + bytes([1, 1, 0])
+                redis_instance().publish(live.channel(page_id), reply)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+        pubsub.close()
 
 
 @pytest.fixture(autouse=True)

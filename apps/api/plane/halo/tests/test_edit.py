@@ -9,8 +9,7 @@ from crum import impersonate
 
 from plane.db.models import Page, PageVersion
 from plane.halo import edit, live, ydoc
-from plane.halo.tests.conftest import doc_for
-from plane.settings.redis import redis_instance
+from plane.halo.tests.conftest import doc_for, live_channel
 
 ORIGINAL = "<p>Alpha</p><p>Beta</p><p>Gamma</p>"
 
@@ -37,14 +36,9 @@ def test_body_edit_saves_document_html_and_versions(world, fake_live):
 
 @pytest.mark.django_db
 def test_open_page_is_refused_and_unchanged(world, fake_live):
-    pubsub = redis_instance().pubsub()
-    pubsub.subscribe(live.channel(world.public.id))
-    try:
-        pubsub.get_message(timeout=2)
+    with live_channel(world.public.id):
         with pytest.raises(edit.EditRefused) as refused:
             _edit(world, html="<p>Other</p>")
-    finally:
-        pubsub.close()
     assert (refused.value.status, refused.value.code) == (409, "page_open")
     assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
     assert fake_live.calls == []
