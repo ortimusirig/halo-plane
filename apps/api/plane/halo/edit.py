@@ -126,7 +126,8 @@ def text_behind(page_id) -> bool:
     return PageTextBehind.objects.filter(page_id=page_id).exists()
 
 
-COPY_STALE_AFTER = timedelta(hours=1)  # a copy task that has not finished by then has failed
+# A copy task that has not finished by then has failed or is stuck; its late write is safe (tasks.finish_page_copy).
+COPY_STALE_AFTER = timedelta(minutes=2)
 
 
 def being_copied(page_id) -> bool:

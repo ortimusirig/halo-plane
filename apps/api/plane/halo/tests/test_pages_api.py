@@ -603,28 +603,101 @@ def test_duplicate_is_halo_s_and_marks_the_copy_until_its_copy_task_ran(world, a
     assert ProjectPage.objects.filter(page=copy, project=world.project).exists()
     assert PageBeingCopied.objects.filter(page_id=copy.id).exists()
     queued = [call.kwargs for call in no_celery.call_args_list]
-    # Plane's copy task is not queued itself: Halo's finish_page_copy runs it, then removes the mark.
+    # Plane's copy task is not queued: Halo's finish_page_copy does its work, then removes the mark.
     assert not any("entity_name" in kwargs for kwargs in queued)
-    copy_kwargs = next(kwargs for kwargs in queued if set(kwargs) == {"page_id", "project_id", "slug", "user_id"})
-    with patch("plane.halo.tasks.copy_s3_objects_of_description_and_assets") as plane_copy:
-        finish_page_copy(**copy_kwargs)
-    plane_copy.assert_called_once_with(entity_name="PAGE", entity_identifier=copy.id, project_id=world.project.id,
-                                       slug=world.workspace.slug, user_id=world.owner.user.id)
+    copy_kwargs = next(kwargs for kwargs in queued if set(kwargs) == {"page_id", "project_id", "user_id"})
+    assert copy_kwargs == {"page_id": copy.id, "project_id": world.project.id, "user_id": world.owner.user.id}
+    finish_page_copy(**copy_kwargs)
     assert not PageBeingCopied.objects.filter(page_id=copy.id).exists()
+    assert Page.objects.get(pk=copy.pk).description_html == ORIGINAL  # no images, nothing to change
 
 
-def test_a_failed_copy_task_still_removes_the_mark(world):
+IMAGE_HTML = '<p>Alpha</p><image-component src="old-asset"></image-component>'
+COPIED = [{"old_asset_id": "old-asset", "new_asset_id": "new-asset"}]
+
+
+def _copy_in_progress(world):
     from django.utils import timezone
 
     from plane.halo.models import PageBeingCopied
+
+    copy = world.make_page(world.owner, "Plan (Copy)", IMAGE_HTML, binary=False)
+    PageBeingCopied.objects.create(page_id=copy.id, since=timezone.now())
+    return copy
+
+
+def _finish(world, copy):
     from plane.halo.tasks import finish_page_copy
 
-    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
-    with patch("plane.halo.tasks.copy_s3_objects_of_description_and_assets", side_effect=RuntimeError("s3")):
-        with pytest.raises(RuntimeError):
-            finish_page_copy(page_id=world.public.id, project_id=world.project.id, slug=world.workspace.slug,
-                             user_id=world.owner.user.id)
-    assert not PageBeingCopied.objects.filter(page_id=world.public.id).exists()
+    finish_page_copy(page_id=copy.id, project_id=world.project.id, user_id=world.owner.user.id)
+
+
+def test_copy_task_points_only_the_copy_s_html_at_the_copied_images(world):
+    from plane.halo.models import PageBeingCopied
+
+    copy = _copy_in_progress(world)
+    before = Page.objects.get(pk=copy.pk)
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED) as copy_assets:
+        _finish(world, copy)
+    assert copy_assets.call_args.args[1:] == (copy.id, world.project.id, ["old-asset"], world.owner.user.id)
+    after = Page.objects.get(pk=copy.pk)
+    assert 'src="new-asset"' in after.description_html and "old-asset" not in after.description_html
+    assert after.updated_at > before.updated_at  # a stamp read before the task no longer passes
+    assert (after.name, after.description_binary) == ("Plan (Copy)", None)
+    assert not PageBeingCopied.objects.filter(page_id=copy.id).exists()
+
+
+@pytest.mark.parametrize("meanwhile", ["edited", "document built", "archived and renamed"])
+def test_a_late_copy_task_never_overwrites_what_happened_meanwhile(world, meanwhile):
+    """However late the task runs (a stalled worker after its mark expired), it changes nothing but the HTML it
+    read, and that only while the text is unchanged and the page has no document yet."""
+    from django.utils import timezone
+
+    copy = _copy_in_progress(world)
+
+    def copy_assets(*args):
+        if meanwhile == "edited":
+            Page.objects.filter(pk=copy.pk).update(description_html="<p>Edited meanwhile</p>")
+        elif meanwhile == "document built":
+            Page.objects.filter(pk=copy.pk).update(description_binary=doc_for(["Alpha"]))
+        else:
+            Page.objects.filter(pk=copy.pk).update(archived_at=timezone.now(), name="Renamed meanwhile")
+        return COPIED
+
+    with patch("plane.halo.tasks.copy_assets", side_effect=copy_assets):
+        _finish(world, copy)
+    after = Page.objects.get(pk=copy.pk)
+    if meanwhile == "edited":
+        assert after.description_html == "<p>Edited meanwhile</p>"
+    elif meanwhile == "document built":
+        assert after.description_html == IMAGE_HTML
+    else:
+        assert 'src="new-asset"' in after.description_html
+        assert after.archived_at is not None and after.name == "Renamed meanwhile"
+
+
+def test_a_failed_copy_task_still_removes_the_mark(world):
+    from plane.halo.models import PageBeingCopied
+
+    copy = _copy_in_progress(world)
+    with patch("plane.halo.tasks.copy_assets", side_effect=RuntimeError("s3 is down")):
+        _finish(world, copy)  # logged, as in Plane's task
+    assert not PageBeingCopied.objects.filter(page_id=copy.id).exists()
+    assert Page.objects.get(pk=copy.pk).description_html == IMAGE_HTML
+
+
+def test_duplicate_of_a_page_whose_text_is_behind_is_refused(world, api_client):
+    """A copy is made from the stored HTML; while that lags the document it would miss text."""
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied, PageTextBehind
+
+    PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now())
+    api_client.force_authenticate(user=world.owner.user)
+    pages = Page.objects.count()
+    response = api_client.post(_app_page_url(world, "duplicate/"))
+    assert (response.status_code, response.json()["code"]) == (409, "page_text_behind")
+    assert Page.objects.count() == pages and not PageBeingCopied.objects.exists()
 
 
 def test_duplicate_keeps_plane_s_private_page_rule(world, api_client):
@@ -674,15 +747,15 @@ def test_editor_load_waits_until_the_copy_task_ran(world, api_client):
     assert copying.call_count == 3 and sleep.call_count == 2
 
 
-def test_a_copy_mark_older_than_an_hour_is_ignored(world, fake_live, api_client):
-    """A worker that died mid-copy never removes its mark; after an hour the page is usable again."""
+def test_an_expired_copy_mark_is_ignored(world, fake_live, api_client):
+    """A worker that died mid-copy never removes its mark; after two minutes the page is usable again."""
     from datetime import timedelta
 
     from django.utils import timezone
 
     from plane.halo.models import PageBeingCopied
 
-    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now() - timedelta(hours=2))
+    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now() - timedelta(minutes=3))
     api_client.force_authenticate(user=world.owner.user)
     assert api_client.get(_description_url(world)).status_code == 200
     url = f"{world.base}{world.public.id}/"

@@ -56,6 +56,12 @@ if [ "$candidate" != HEAD ]; then
   exit "$status"
 fi
 
+# This run builds from this checkout (Dockerfile, pins, tests), so it must be exactly the candidate commit.
+if ! git diff --quiet HEAD -- apps/api halo || [ -n "$(git ls-files --others --exclude-standard apps/api halo)" ]; then
+  echo "FAIL: uncommitted changes under apps/api or halo/: commit them, or gate a branch with --candidate"
+  exit 1
+fi
+
 py=$(command -v python3 || command -v python)
 newer=$("$py" -c '
 import re, sys
@@ -101,6 +107,27 @@ trap 'git worktree remove --force "$work"' EXIT
 git diff --binary "$candidate_base" "$candidate" -- apps/api > "$work/halo.patch"
 
 failures=0
+# The patch is the candidate's diff from the tag its release.env names, so that tag must be in its history
+# (a relabelled, not rebased branch would diff in reversions of every upstream change), and the diff may touch
+# only Halo's own app and the Plane files Halo changes (PATCH_PLANE_FILES in release.env).
+if git merge-base --is-ancestor "$candidate_base" "$candidate"; then
+  echo "OK   candidate's history contains $candidate_base"
+else
+  echo "FAIL candidate is not built on $candidate_base: its release.env says so, but the tag is not in its history"
+  failures=$((failures + 1))
+fi
+outside=$(git diff --name-only "$candidate_base" "$candidate" -- apps/api | while read -r path; do
+  case " $PATCH_PLANE_FILES " in *" $path "*) continue ;; esac
+  case "$path" in apps/api/plane/halo/*) continue ;; esac
+  echo "$path"
+done)
+if [ -z "$outside" ]; then
+  echo "OK   patch touches only plane/halo and the Plane files in PATCH_PLANE_FILES"
+else
+  echo "FAIL patch touches files outside Halo's patch:"
+  echo "$outside" | sed 's/^/     /'
+  failures=$((failures + 1))
+fi
 if (cd "$work" && git apply --check halo.patch); then
   echo "OK   patch applies to $new"
 else
@@ -121,19 +148,22 @@ if grep -rlqE "pages" "$work/apps/api/plane/api/urls/"; then
 else
   echo "OK   Plane's API v1 still has no page routes"
 fi
-fingerprint() {  # <class name>: a short hash of each method of that class in Plane's page views
+fingerprint() {  # <file under apps/api/plane> <class or function>: a short hash of the function or of each method
   "$py" -c '
 import ast, hashlib, sys
 src = open(sys.argv[1], encoding="utf-8").read().replace(chr(13) + chr(10), chr(10))
-for node in ast.walk(ast.parse(src)):
+def digest(node):
+    return node.name + "=" + hashlib.sha256(ast.get_source_segment(src, node).encode()).hexdigest()[:16]
+for node in ast.parse(src).body:
     if isinstance(node, ast.ClassDef) and node.name == sys.argv[2]:
-        print(" ".join(item.name + "=" + hashlib.sha256(ast.get_source_segment(src, item).encode()).hexdigest()[:16]
-                       for item in node.body if isinstance(item, ast.FunctionDef)))
-' "$work/apps/api/plane/app/views/page/base.py" "$1"
+        print(" ".join(digest(item) for item in node.body if isinstance(item, ast.FunctionDef)))
+    elif isinstance(node, ast.FunctionDef) and node.name == sys.argv[2]:
+        print(digest(node))
+' "$work/apps/api/plane/$1" "$2"
 }
 mirrored() {  # <class name> <expected fingerprint> <route suffix> <Halo class>: Halo's subclass copies that code
   local found
-  found=$(fingerprint "$1")
+  found=$(fingerprint app/views/page/base.py "$1")
   if [ "$found" = "$2" ] \
     && grep -qF "/pages/<uuid:page_id>/$3/" "$work/apps/api/plane/app/urls/page.py"; then
     echo "OK   Plane's $1 is unchanged (Halo's $4 mirrors it)"
@@ -144,6 +174,15 @@ mirrored() {  # <class name> <expected fingerprint> <route suffix> <Halo class>:
 }
 mirrored PagesDescriptionViewSet "$UPSTREAM_DESCRIPTION_FINGERPRINT" description HaloPagesDescriptionViewSet
 mirrored PageDuplicateEndpoint "$UPSTREAM_DUPLICATE_FINGERPRINT" duplicate HaloPageDuplicateEndpoint
+copy_found=$(for name in copy_s3_objects_of_description_and_assets copy_assets extract_asset_ids replace_asset_ids; do
+  fingerprint bgtasks/copy_s3_object.py "$name"
+done | tr '\n' ' ' | sed 's/ $//')
+if [ "$copy_found" = "$UPSTREAM_COPY_FINGERPRINT" ]; then
+  echo "OK   Plane's copy task and helpers are unchanged (Halo's finish_page_copy does that task for pages)"
+else
+  echo "OPEN Plane's copy task changed ($copy_found): compare with finish_page_copy in plane/halo/tasks.py"
+  open_items=$((open_items + 1))
+fi
 hocuspocus=$(grep -E '"@hocuspocus/server"' "$work/pnpm-workspace.yaml" | tr -d ' "' || true)
 if [ "$hocuspocus" = "@hocuspocus/server:2.15.2" ]; then
   echo "OK   live uses Hocuspocus 2.15.2 (channel, messages and probe as tested)"

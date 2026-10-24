@@ -78,12 +78,19 @@ Halo. Only then switch the backend services to the image.
    while an API edit writes the same page. The save itself mirrors Plane's code, with its background tasks
    started after commit. Plane's other web-app routes that save a whole page (properties, lock, access) run
    Plane's own code through a subclass (`HaloAppPageViewSet`) that locks the page's row before Plane reads it,
-   so none of them can write old text back over an API edit that committed in between. Plane's page duplicate
-   runs through a subclass too (`HaloPageDuplicateEndpoint`, the same steps as Plane's): Plane's copy task
-   copies the page's images and then saves the whole page it read, so until it has run (Halo's
-   `finish_page_copy` runs it) the new page is marked in a second table (`halo_page_being_copied`). While
-   marked, API edits of it are refused (`page_not_ready`) and editors' loads wait up to 15 seconds; a mark older
-   than an hour (a worker that died) is ignored.
+   so none of them can write old text back over an API edit that committed in between.
+
+   Plane's page duplicate runs through a subclass too (`HaloPageDuplicateEndpoint`, Plane's steps). It locks the
+   source page and refuses (`page_text_behind`) while the source's stored HTML lags its document, since a copy
+   is made from the HTML. Plane's copy task (it copies the images, then saves the whole page it read, twice) is
+   replaced for pages by Halo's `finish_page_copy`, built from Plane's own helpers: it copies the images and
+   points the copy's HTML at them in one update of the HTML alone, made only if the text is unchanged and the
+   page has no document yet. So it never writes back a name, archive, lock or access change, nor overwrites an
+   edit, however late it runs. The copy's document is built from its HTML on the first load, as for every new
+   page. Until the task has run the copy is marked in a second table (`halo_page_being_copied`), so the images
+   are copied before anyone opens it: API edits are refused (`page_not_ready`) and editors' loads wait up to 15
+   seconds; a mark older than two minutes (a stuck or dead worker) is ignored, and the copy then keeps showing
+   the original's images.
 
 4. Fix of Plane CE v1.4.2's page version history: `bgtasks/page_version_task.py` read `page.description`,
    which does not exist (`description_json` does), so no page version was ever written. The same task skips
@@ -97,9 +104,7 @@ Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with two tables
 Known limits: typing on an open page can be lost only where an API edit rewrote the same characters while
 live missed the half-second open-page probe. Pages over 100 kB of HTML (live's converter limit) cannot be
 edited through the API, and their first document is built by live itself, as in stock Plane. A marked page
-stays marked until an editor saves it again (any small change). Plane's copy task saves the whole duplicated
-page it read, so a rename or property change of a new copy in its first seconds can be undone by it, as in
-stock Plane; Halo's API edits and editor loads wait for it.
+stays marked until an editor saves it again (any small change), and cannot be duplicated until then.
 
 ## Build and test
 
@@ -109,11 +114,13 @@ bash halo/test-backend.sh                  # Halo tests in that image (postgres 
 bash halo/test-backend.sh --dev            # the same against the working tree
 bash halo/test-backend.sh --upstream plane/tests   # Plane's own tests on the unpatched image (baseline)
 bash halo/e2e/run.sh                       # end-to-end proof with Plane's real live service
+bash halo/test-release-scripts.sh          # refusals of the build and the gate (no Docker)
 ```
 
 `build-backend.sh` turns the committed diff from `PLANE_TAG` into `halo/patch/halo.patch`, and
 `Dockerfile.backend` applies it with `git apply` to the code inside `makeplane/plane-backend:v1.4.2`;
-a patch that no longer applies stops the build. The image replaces the `api`, `worker`, `beat-worker`
+a patch that no longer applies stops the build, and so does any uncommitted change under `apps/api` or `halo/`
+(the image is always exactly one commit, the one its source tag names). The image replaces the `api`, `worker`, `beat-worker`
 and `migrator` images of a Plane deployment; run the migrator once (Halo's two tables, migration
 `halo.0001_initial`; no change to Plane's tables). The live service
 stays the upstream image; the API reaches it at `HALO_LIVE_URL` (default `http://live:3000/live/`).
@@ -124,10 +131,11 @@ Halo runs one release behind Plane's newest and never downgrades. For a new Plan
 `bash halo/upgrade-check.sh <tag>`, the release gate: it checks the patch against the new tag, builds the
 image on the new upstream image, runs the Halo tests and the end-to-end test with the new live image, and
 reports what needs a decision (the version bug fixed upstream, Plane's own API page routes, a changed
-description or duplicate endpoint, a changed Hocuspocus or converter). It passes only for a candidate branch
-built on the new tag whose `HALO_TAG` (in its `release.env`) is tagged on the candidate's commit, so the image
-and its published source are the same tree. `--check-only` gives the report without building;
-it is not a gate.
+description or duplicate endpoint, a changed copy task, a changed Hocuspocus or converter). It passes only for a
+candidate branch built on the new tag (the tag in its history, not only in its `release.env`) whose `HALO_TAG` is
+tagged on the candidate's commit, so the image and its published source are the same tree; and it fails a patch
+that changes Plane files beyond `apps/api/plane/halo/` and the list in `release.env` (`PATCH_PLANE_FILES`).
+`--check-only` gives the report without building; it is not a gate.
 
 ## Rollback
 

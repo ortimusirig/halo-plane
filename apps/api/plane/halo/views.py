@@ -270,24 +270,30 @@ class HaloAppPageViewSet(PageViewSet):
 
 
 class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
-    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps), except that Plane's copy task runs as
-    Halo's finish_page_copy while the new page is marked as being copied: that task saves the whole page it
-    read, so until it is done API edits are refused and editors' loads wait."""
+    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps), with three changes. The source page is
+    locked while it is copied, and refused while its stored HTML lags its document (a copy is made from the HTML,
+    so it would miss text). The copy task is Halo's finish_page_copy, which changes only the copy's HTML. Until it
+    has run, the copy is marked as being copied: editors' loads wait and API edits are refused, so the images are
+    copied before anyone opens the page."""
 
     def post(self, request, slug, project_id, page_id):
-        page = Page.objects.get(
-            pk=page_id, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
-        )
-        if page.access == Page.PRIVATE_ACCESS and page.owned_by_id != request.user.id:
-            return Response({"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN)
-        project_ids = ProjectPage.objects.filter(page_id=page_id).values_list("project_id", flat=True)
-        page.pk = None
-        page.name = f"{page.name} (Copy)"
-        page.description_binary = None
-        page.owned_by = request.user
-        page.created_by = request.user
-        page.updated_by = request.user
         with transaction.atomic():
+            page = Page.objects.select_for_update(of=("self",)).get(
+                pk=page_id, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
+            )
+            if page.access == Page.PRIVATE_ACCESS and page.owned_by_id != request.user.id:
+                return Response({"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN)
+            if text_behind(page_id):
+                return Response({"error": "Halo is still taking in this page's latest text from an editor. Make any "
+                                          "small change in the page, then duplicate it again.",
+                                 "code": "page_text_behind"}, status=status.HTTP_409_CONFLICT)
+            project_ids = list(ProjectPage.objects.filter(page_id=page_id).values_list("project_id", flat=True))
+            page.pk = None
+            page.name = f"{page.name} (Copy)"
+            page.description_binary = None
+            page.owned_by = request.user
+            page.created_by = request.user
+            page.updated_by = request.user
             page.save()
             for project_id in project_ids:
                 ProjectPage.objects.create(
@@ -300,7 +306,7 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
             PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
         page_transaction.delay(new_description_html=page.description_html, old_description_html=None, page_id=page.id)
         # Plane passes the last project of the loop to its copy task; so does Halo.
-        finish_page_copy.delay(page_id=page.id, project_id=project_id, slug=slug, user_id=request.user.id)
+        finish_page_copy.delay(page_id=page.id, project_id=project_id, user_id=request.user.id)
         page = (
             Page.objects.filter(pk=page.id)
             .annotate(

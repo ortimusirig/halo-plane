@@ -211,5 +211,30 @@ check("10 restoring the before version brings the old Beta back",
   restored.status === 200 && restoredHtml.includes(">Beta<") && !restoredHtml.includes("AURA"),
   `${restored.status} ${restoredHtml}`);
 
+// 11. Plane's duplicate from the web app: the copy stays marked until the worker ran Plane's copy task
+// (through Halo's finish_page_copy, so this also proves the worker finds Halo's tasks); then it opens and the
+// API can edit it.
+const duplicated = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${pageId}/duplicate/`, {
+  method: "POST",
+  headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
+});
+const copy = await duplicated.json();
+check("11a duplicate in the web app", duplicated.status === 201 && copy.name === "E2E page (Copy)", JSON.stringify(copy));
+const unmarked = await waitFor(async () =>
+  inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${copy.id}").exists())`)
+    .split(/\r?\n/).pop() === "False", 30000);
+check("11b the worker ran the copy task and removed the mark", Boolean(unmarked), "the copy is still marked");
+const docC = new Y.Doc();
+const editorC = await connect(docC, copy.id);
+await waitFor(() => blocks(docC).length === 3);
+check("11c the copy opens with the page's text", blocks(docC)[1] === "Beta", JSON.stringify(blocks(docC)));
+closeEditor(editorC);
+await waitFor(() => closed(copy.id));
+const appended = await api("PATCH", `pages/${copy.id}/`, {
+  append_html: "<p>Added to the copy</p>",
+  expected_updated_at: (await page(copy.id)).updated_at,
+});
+check("11d the API edits the copy", appended.status === 200 && appended.data.changed, JSON.stringify(appended.data));
+
 console.log(failures ? `${failures} FAILED` : "ALL PASSED");
 process.exit(failures ? 1 : 0);
