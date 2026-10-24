@@ -584,7 +584,8 @@ def test_create_commits_nothing_when_the_answer_cannot_be_built(world, no_celery
         response = world.owner.client.post(world.base, {"name": "New"}, format="json")
     assert response.status_code == 404
     assert Page.objects.count() == pages
-    no_celery.assert_not_called()
+    # No page task queued (Plane's API request log task may be).
+    assert not any("new_description_html" in call.kwargs for call in no_celery.call_args_list)
 
 
 def test_duplicate_is_halo_s_and_marks_the_copy_until_its_copy_task_ran(world, api_client, no_celery):

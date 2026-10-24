@@ -37,13 +37,21 @@ async function waitFor(fn, ms = 15000) {
 }
 
 async function api(method, path, body) {
-  const response = await fetch(base + path, {
-    method,
-    headers: { "X-Api-Key": seed.token, "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await response.text();
-  return { status: response.status, data: text ? JSON.parse(text) : null };
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const response = await fetch(base + path, {
+        method,
+        headers: { "X-Api-Key": seed.token, "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await response.text();
+      return { status: response.status, data: text ? JSON.parse(text) : null };
+    } catch (error) {
+      // Node's fetch can reuse an idle keep-alive socket the API (uvicorn, 5 s) has just closed; the request never
+      // reaches the API. A read is safe to send again; a write is not.
+      if (method !== "GET" || attempt > 1 || error?.cause?.code !== "UND_ERR_SOCKET") throw error;
+    }
+  }
 }
 
 const textOf = (node) =>
