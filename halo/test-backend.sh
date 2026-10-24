@@ -24,7 +24,7 @@ fi
 [ $# -gt 0 ] || set -- plane/halo/tests
 
 tag=halo-backend-test:local
-docker build -q -f halo/Dockerfile.backend-test --build-arg BASE_IMAGE="$base" -t "$tag" . >/dev/null
+docker build -q -f halo/Dockerfile.backend-test --build-arg BASE_IMAGE="$base" -t "$tag" halo >/dev/null
 
 net="halo-test-$$"
 cleanup() {

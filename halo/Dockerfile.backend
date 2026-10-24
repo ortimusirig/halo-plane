@@ -1,0 +1,26 @@
+# Halo backend: Plane CE backend image plus Halo's patch (AGPL-3.0-only; source: halo/HALO.md).
+# Built by halo/build-backend.sh, which writes halo/patch/halo.patch (build context: halo/) from this branch.
+ARG PLANE_IMAGE=makeplane/plane-backend:v1.4.2
+FROM ${PLANE_IMAGE} AS upstream
+
+FROM alpine:3.20 AS patcher
+RUN apk add --no-cache git
+COPY --from=upstream /code /code
+COPY patch/halo.patch /tmp/halo.patch
+# Applies to the code inside the upstream image; a patch that no longer fits stops the build here.
+RUN cd /code && git apply --check -p3 /tmp/halo.patch && git apply -p3 /tmp/halo.patch
+
+FROM upstream
+COPY --from=patcher /code/plane /code/plane
+COPY --from=patcher /code/requirements /code/requirements
+COPY requirements-halo.txt /tmp/requirements-halo.txt
+RUN pip install --no-cache-dir --no-deps --require-hashes -r /tmp/requirements-halo.txt \
+    && python -c "import pycrdt" && test -f /code/plane/halo/edit.py \
+    && grep -q "description_json=page.description_json" /code/plane/bgtasks/page_version_task.py
+ARG HALO_REVISION=unknown
+ARG HALO_TAG=halo-v1.4.2-pages.1
+LABEL org.opencontainers.image.source="https://github.com/ortimusirig/halo-plane" \
+      org.opencontainers.image.revision="${HALO_REVISION}" \
+      org.opencontainers.image.version="${HALO_TAG}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.description="Halo: Plane Community Edition v1.4.2 backend with Halo's page API patch"
