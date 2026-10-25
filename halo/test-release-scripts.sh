@@ -66,6 +66,15 @@ expect "gate fails a patch outside Halo's files" 1 "apps/api/plane/app/views/pag
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --candidate "$outside" --check-only
 expect "this branch passes the gate's checks" 0 "CHECK ONLY: 0 failed" \
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --check-only
+# Plane's code that Halo mirrors or replaces is unchanged in the new tag, so no fingerprint item may be open.
+fingerprints=$("${nodocker[@]}" bash halo/upgrade-check.sh "$new" --check-only 2>&1 || true)
+if grep -q "^OPEN Plane's" <<<"$fingerprints"; then
+  echo "FAIL fingerprints of Plane's mirrored code match:"
+  grep "^OPEN Plane's" <<<"$fingerprints" | sed 's/^/     /'
+  failures=$((failures + 1))
+else
+  echo "PASS fingerprints of Plane's mirrored code match"
+fi
 expect "the gate refuses a release candidate before building" 1 "FAIL release order (n-1)" \
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new"
 
