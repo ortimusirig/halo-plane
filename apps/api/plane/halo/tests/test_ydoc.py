@@ -277,4 +277,5 @@ def test_image_sources_are_listed_and_repointed_without_touching_anything_else()
     doc.apply_update(new)
     image = doc.get(ydoc.BODY, type=XmlFragment).children[1]
     assert dict(image.attributes) == {"src": "asset-2", "width": "35%"}
-    assert text_of(new).replace("asset-2", "asset-1") == text_of(old)
+    # Pointed back, the document is the old one again (block by block, attributes compared as a set).
+    assert ydoc.body_signature(ydoc.with_image_sources(new, {"asset-2": "asset-1"})) == ydoc.body_signature(old)
