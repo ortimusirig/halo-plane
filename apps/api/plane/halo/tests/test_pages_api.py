@@ -399,6 +399,10 @@ def test_first_load_builds_the_document_from_the_html(world, fake_live, api_clie
     page.refresh_from_db()
     assert body == bytes(page.description_binary) and body
     assert ydoc.body_signature(body) == ydoc.body_signature(doc_for(["One", "Two"]))
+    # Plane's own first document holds the name as its title; the browser's offline fallback shows it from there.
+    loaded = Doc()
+    loaded.apply_update(body)
+    assert str(loaded.get(ydoc.TITLE, type=XmlFragment)).endswith(">Fresh</heading>")
     assert page.updated_at == before  # building the document is not a change
     assert fake_live.calls == ["<p>One</p><p>Two</p>"]
 

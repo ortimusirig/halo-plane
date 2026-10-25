@@ -219,6 +219,21 @@ def _set_title(title: XmlFragment, name: str) -> bool:
     return True
 
 
+def with_title(binary: bytes, name: str) -> bytes:
+    """The whole document with the page's name as its title when its title fragment is empty, the way Plane's
+    getBinaryDataFromDocumentEditorHTMLString adds it (one level-1 heading; 1.0, a float, so that JavaScript reads
+    a number). A document that has a title is returned as it is."""
+    doc = _load(binary)
+    title = doc.get(TITLE, type=XmlFragment)
+    if len(title.children):
+        return binary
+    with doc.transaction():
+        heading = title.children.append(XmlElement("heading", {"level": 1.0}))
+        if name:
+            heading.children.append(XmlText()).insert(0, name)
+    return doc.get_update()
+
+
 def edit_document(
     current: bytes, new_body: bytes | None = None, name: str | None = None, append: bool = False
 ) -> DocumentEdit:

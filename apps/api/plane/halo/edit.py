@@ -84,10 +84,15 @@ def ensure_document(page_pk) -> None:
     page's row lock). updated_at stays: building the document is not a change. Raises live.LiveTooLarge or
     live.LiveUnavailable when live cannot convert it."""
     with transaction.atomic():
-        page = Page.objects.select_for_update().only("pk", "description_html", "description_binary").get(pk=page_pk)
+        page = Page.objects.select_for_update().only("pk", "name", "description_html", "description_binary").get(
+            pk=page_pk
+        )
         if page.description_binary:
             return
         binary, json_data = live.convert_html(page.description_html or "<p></p>")
+        # Live's converter gives the body only; Plane's own first document also holds the page's name as its
+        # title (getBinaryDataFromDocumentEditorHTMLString), which the browser's offline fallback relies on.
+        binary = ydoc.with_title(binary, page.name or "")
         Page.objects.filter(pk=page_pk).update(description_binary=binary, description_json=json_data)
 
 

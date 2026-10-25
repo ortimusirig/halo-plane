@@ -279,3 +279,13 @@ def test_image_sources_are_listed_and_repointed_without_touching_anything_else()
     assert dict(image.attributes) == {"src": "asset-2", "width": "35%"}
     # Pointed back, the document is the old one again (block by block, attributes compared as a set).
     assert ydoc.body_signature(ydoc.with_image_sources(new, {"asset-2": "asset-1"})) == ydoc.body_signature(old)
+
+
+
+def test_an_empty_title_gets_the_page_name_and_a_title_stays():
+    body_only = page(p("Alpha"))
+    titled = ydoc.with_title(body_only, "Plan")
+    assert text_of(titled, ydoc.TITLE) == '<heading level="1">Plan</heading>'
+    assert ydoc.body_signature(titled) == ydoc.body_signature(body_only)
+    assert ydoc.with_title(titled, "Other") == titled
+    assert text_of(ydoc.with_title(body_only, ""), ydoc.TITLE) == '<heading level="1"></heading>'

@@ -122,6 +122,8 @@ const built = inApi(
   `from plane.db.models import Page; p = Page.objects.get(pk="${pageId}"); print(bool(p.description_binary))`,
 );
 check("2b Halo built the page's first document", built.split(/\r?\n/).pop() === "True", built);
+check("2c the first document has the page's title", textOf(docA.getXmlFragment("title")) === "E2E page",
+  textOf(docA.getXmlFragment("title")));
 
 // 3. An API edit while A has it open is refused, and nothing changes.
 const refused = await api("PATCH", `pages/${pageId}/`, {
