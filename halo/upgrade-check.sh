@@ -189,6 +189,49 @@ mirrored() {  # <class> <expected fingerprint> <route suffix> <Halo class> [meth
 mirrored PagesDescriptionViewSet "$UPSTREAM_DESCRIPTION_FINGERPRINT" description HaloPagesDescriptionViewSet
 mirrored PageDuplicateEndpoint "$UPSTREAM_DUPLICATE_FINGERPRINT" duplicate HaloPageDuplicateEndpoint
 mirrored PageViewSet "$UPSTREAM_PAGE_FINGERPRINT" "" HaloAppPageViewSet partial_update
+# Plane's mention indexing: Halo keeps Plane's page_transaction for every ordinary save and relies on its
+# behaviour in tasks.index_page, so the task and every place that calls it are fingerprinted (the callers
+# other than create are mirrored by Halo and fingerprinted above).
+index_found=$(for name in page_transaction extract_all_components get_entity_details; do
+  fingerprint bgtasks/page_transaction_task.py "$name"
+done | tr '\n' ' ' | sed 's/ $//')
+create_found=$(fingerprint app/views/page/base.py PageViewSet | tr ' ' '\n' | grep '^create=' || true)
+index_callers=$("$py" -c '
+import ast, os, sys
+root = os.path.join(sys.argv[1], "apps", "api", "plane")
+callers = set()
+def visit(node, scope, path):
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit(child, scope + [child.name], path)
+            continue
+        if isinstance(child, ast.Call):
+            target = child.func
+            if isinstance(target, ast.Attribute) and target.attr in ("delay", "apply_async"):
+                target = target.value
+            if isinstance(target, ast.Name) and target.id == "page_transaction" and scope:
+                callers.add(path + ":" + ".".join(scope))
+        visit(child, scope, path)
+for dirpath, dirnames, filenames in os.walk(root):
+    rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+    parts = rel.split("/")
+    if "tests" in parts or "halo" in parts or "migrations" in parts:
+        continue
+    for name in filenames:
+        if name.endswith(".py"):
+            path = os.path.join(dirpath, name)
+            src = open(path, encoding="utf-8").read().replace(chr(13) + chr(10), chr(10))
+            visit(ast.parse(src), [], os.path.relpath(path, root).replace(os.sep, "/"))
+print(" ".join(sorted(callers)))
+' "$work" | tr -d '\r')
+if [ "$index_found" = "$UPSTREAM_INDEX_FINGERPRINT" ] && [ "$create_found" = "$UPSTREAM_CREATE_FINGERPRINT" ] \
+  && [ "$index_callers" = "$UPSTREAM_INDEX_CALLERS" ]; then
+  echo "OK   Plane's mention indexing (page_transaction) and its callers are unchanged"
+else
+  echo "OPEN Plane's mention indexing changed: task ($index_found), create ($create_found), callers ($index_callers);"
+  echo "     check tasks.index_page and the merged-save handling in plane/halo/views.py, then update release.conf"
+  open_items=$((open_items + 1))
+fi
 # The page load is Plane's own PagesDescriptionViewSet.retrieve (fingerprinted above): Halo's subclass may define
 # its save (partial_update) and the lookup it uses, and nothing else that could run on a load.
 load_view=$("$py" -c '
