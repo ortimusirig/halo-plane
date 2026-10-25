@@ -85,12 +85,16 @@ Halo. Only then switch the backend services to the image.
      old text back over an API edit that committed in between. The properties PATCH writes `description_html`
      as in Plane (the web app's store sends its whole copy of the page); when that changes the HTML, the page
      is marked as above.
-   - Duplicate (`HaloPageDuplicateEndpoint`) repeats Plane's steps and locks the source page. Plane's copy task
-     (it copies the images, then saves the whole page it read, twice) is replaced for pages by Halo's
-     `finish_page_copy`, built from Plane's own helpers: it copies the images and points the copy's HTML at
-     them in one update of the HTML alone, made only if the text is unchanged and the page has no document yet.
-     So it never writes back a name, archive, lock or access change, nor overwrites an edit, however late it
-     runs. The copy's document is built from its HTML on the first load, as for every new page. Until the task
+   - Duplicate (`HaloPageDuplicateEndpoint`) repeats Plane's steps and locks the source page. When the
+     source's stored HTML lags its document (marked as above), the copy takes the document, the authoritative
+     part, and the same mark, instead of being rebuilt from that HTML alone. Plane's copy task (it copies the
+     images, then saves the whole page it read, twice) is replaced for pages by Halo's `finish_page_copy`,
+     built from Plane's own helpers and fingerprinted by the upgrade gate: it copies the images and points the
+     copy's HTML (and its document, when it took one) at them in one update, made only if neither changed
+     since it read them. So it never writes back a name, archive, lock or access change, nor overwrites an
+     edit, however late it runs. A copy without a document gets one from its HTML on the first load, as every
+     new page does. The end-to-end test checks that a copy with an uploaded image gets the same text and an own
+     copy of the image file, as Plane's own copy task gives. Until the task
      has run the copy is marked in a second table (`halo_page_being_copied`): API edits of it are refused
      (`page_not_ready`) and loads wait as above; a mark older than two minutes (a stuck or dead worker) is
      ignored, and the copy then keeps showing the original's images.
@@ -129,7 +133,8 @@ a patch that no longer applies stops the build, and so does any uncommitted chan
 (the image is always exactly one commit, the one its source tag names). The image replaces the `api`, `worker`, `beat-worker`
 and `migrator` images of a Plane deployment; run the migrator once (Halo's two tables, migration
 `halo.0001_initial`; no change to Plane's tables). The live service
-stays the upstream image; the API reaches it at `HALO_LIVE_URL` (default `http://live:3000/live/`).
+stays the upstream image; the API reaches it at `HALO_LIVE_URL`, else at Plane's own `LIVE_BASE_URL` plus
+`LIVE_BASE_PATH`, else at `http://live:3000/live/` (live on Plane's compose network).
 
 ## Upgrade
 

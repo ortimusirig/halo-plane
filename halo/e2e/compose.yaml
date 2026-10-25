@@ -1,5 +1,5 @@
 # Halo page edit end-to-end test: the Halo backend image with Plane's real live service.
-# Started by halo/e2e/run.sh; nothing here is for production (fixed test secrets, no TLS, no S3).
+# Started by halo/e2e/run.sh; nothing here is for production (fixed test secrets, no TLS, a local MinIO as S3).
 name: halo-e2e
 
 x-app-env: &app-env
@@ -12,6 +12,13 @@ x-app-env: &app-env
   DEBUG: "0"
   GUNICORN_WORKERS: "1"
   HALO_LIVE_URL: http://live:3000/live/
+  # Plane's S3 settings with MinIO, as in Plane's own self-hosting compose (page images and their copies).
+  USE_MINIO: "1"
+  AWS_REGION: ""
+  AWS_ACCESS_KEY_ID: access-key
+  AWS_SECRET_ACCESS_KEY: secret-key
+  AWS_S3_ENDPOINT_URL: http://plane-minio:9000
+  AWS_S3_BUCKET_NAME: uploads
 
 x-backend: &backend
   image: ${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.1}
@@ -28,6 +35,13 @@ services:
   plane-redis:
     image: valkey/valkey:7.2.11-alpine
 
+  plane-minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /export
+    environment:
+      MINIO_ROOT_USER: access-key
+      MINIO_ROOT_PASSWORD: secret-key
+
   plane-mq:
     image: rabbitmq:3.13.6-management-alpine
     environment:
@@ -42,18 +56,20 @@ services:
 
   api:
     <<: *backend
-    # Plane's API entrypoint without create_bucket and collectstatic (no S3 in this test).
+    # Plane's API entrypoint without collectstatic.
     command:
       - sh
       - -c
       - >-
         python manage.py wait_for_db && python manage.py wait_for_migrations &&
         python manage.py register_instance halo-e2e && python manage.py configure_instance &&
+        python manage.py create_bucket &&
         exec gunicorn -w 1 -k uvicorn.workers.UvicornWorker plane.asgi:application --bind 0.0.0.0:8000
     ports: ["127.0.0.1:18000:8000"]
     depends_on:
       migrator: {condition: service_completed_successfully}
       plane-mq: {condition: service_started}
+      plane-minio: {condition: service_started}
 
   worker:
     <<: *backend

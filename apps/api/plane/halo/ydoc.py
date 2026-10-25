@@ -253,6 +253,35 @@ def protected_parts(binary: bytes) -> Counter:
     return parts
 
 
+IMAGE_TAGS = ("imageComponent", "image")
+
+
+def _images(node):
+    for child in node.children:
+        if isinstance(child, XmlElement):
+            if child.tag in IMAGE_TAGS:
+                yield child
+            yield from _images(child)
+
+
+def image_sources(binary: bytes) -> list[str]:
+    """The src of every image in the body, in order (an uploaded image's src is its asset id)."""
+    sources = (dict(image.attributes).get("src") for image in _images(_load(binary).get(BODY, type=XmlFragment)))
+    return [str(src) for src in sources if src]
+
+
+def with_image_sources(binary: bytes, sources: dict) -> bytes:
+    """The whole document with each image whose src is a key of sources pointed at its value (a duplicated page's
+    own image copies); everything else stays as it is."""
+    doc = _load(binary)
+    with doc.transaction():
+        for image in list(_images(doc.get(BODY, type=XmlFragment))):
+            src = dict(image.attributes).get("src")
+            if src in sources:
+                image.attributes["src"] = sources[src]
+    return doc.get_update()
+
+
 def removed_parts(before: bytes, after: bytes) -> list[str]:
     """Plain descriptions of the protected parts in before that after no longer has."""
     lost = protected_parts(before) - protected_parts(after)

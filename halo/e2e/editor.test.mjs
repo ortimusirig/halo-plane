@@ -244,5 +244,70 @@ const appended = await api("PATCH", `pages/${copy.id}/`, {
 });
 check("11d the API edits the copy", appended.status === 200 && appended.data.changed, JSON.stringify(appended.data));
 
+// 12. A duplicate with an uploaded image matches stock Plane: the copy gets its own copy of the image file and the
+// same text. Plane's own copy task runs here on a second copy of the same page, for comparison.
+const assetId = inApi(
+  [
+    "import io",
+    "from plane.db.models import FileAsset, Project",
+    "from plane.settings.storage import S3Storage",
+    `project = Project.objects.get(pk="${seed.project_id}")`,
+    'key = f"{project.workspace_id}/e2e-image.png"',
+    'S3Storage().upload_file(io.BytesIO(b"e2e image bytes"), key, "image/png")',
+    'asset = FileAsset.objects.create(attributes={"name": "e2e-image.png", "type": "image/png", "size": 15},',
+    '    asset=key, size=15, workspace_id=project.workspace_id, project=project, entity_type="PAGE_DESCRIPTION",',
+    "    is_uploaded=True)",
+    "print(asset.id)",
+  ].join("\n"),
+).split(/\r?\n/).pop();
+const imageHtml = `<p>Before the image</p><image-component src="${assetId}"></image-component><p>After the image</p>`;
+const imaged = await api("POST", "pages/", { name: "E2E image page", description_html: imageHtml });
+check("12a page with an uploaded image", imaged.status === 201 && imaged.data.description_html.includes(assetId),
+  JSON.stringify(imaged.data));
+const imageCopyResponse = await fetch(
+  `${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${imaged.data.id}/duplicate/`,
+  { method: "POST", headers: { Cookie: seed.cookie, "Content-Type": "application/json" } },
+);
+const imageCopy = await imageCopyResponse.json();
+await waitFor(async () =>
+  inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${imageCopy.id}").exists())`)
+    .split(/\r?\n/).pop() === "False", 30000);
+const compared = JSON.parse(inApi(
+  [
+    "import json",
+    "from plane.bgtasks.copy_s3_object import copy_s3_objects_of_description_and_assets",
+    "from plane.db.models import FileAsset, Page, ProjectPage",
+    "from plane.settings.storage import S3Storage",
+    `stock = Page.objects.get(pk="${imaged.data.id}")`,
+    'stock.pk, stock.name, stock.description_binary = None, "E2E image page (stock copy)", None',
+    "stock.save()",
+    `ProjectPage.objects.create(workspace_id=stock.workspace_id, project_id="${seed.project_id}", page_id=stock.id)`,
+    `copy_s3_objects_of_description_and_assets("PAGE", stock.id, "${seed.project_id}", "${seed.slug}", "${seed.user_id}")`,
+    "storage = S3Storage()",
+    "def files(page_id):",
+    "    return [storage.s3_client.get_object(Bucket=storage.aws_storage_bucket_name, Key=a.asset.name)['Body'].read().decode()",
+    "            for a in FileAsset.objects.filter(page_id=page_id, is_uploaded=True)]",
+    `print(json.dumps({"halo": Page.objects.get(pk="${imageCopy.id}").description_html,`,
+    '                  "stock": Page.objects.get(pk=stock.id).description_html,',
+    `                  "halo_files": files("${imageCopy.id}"), "stock_files": files(stock.id)}))`,
+  ].join("\n"),
+).split(/\r?\n/).pop());
+const sourceOf = (html) => html.replace(/src="[^"]+"/g, `src="${assetId}"`);
+const haloAsset = (compared.halo.match(/src="([^"]+)"/) ?? [])[1];
+check("12b the copy points at its own copy of the image", haloAsset && haloAsset !== assetId, compared.halo);
+check("12c the copy's text and image file match stock Plane's copy",
+  sourceOf(compared.halo) === sourceOf(compared.stock) &&
+    ["Before the image", "After the image"].every((text) => compared.halo.includes(text)) &&
+    JSON.stringify(compared.halo_files) === '["e2e image bytes"]' &&
+    JSON.stringify(compared.halo_files) === JSON.stringify(compared.stock_files),
+  JSON.stringify(compared));
+const docD = new Y.Doc();
+const editorD = await connect(docD, imageCopy.id);
+await waitFor(() => docD.getXmlFragment("default").length === 3);
+const image = docD.getXmlFragment("default").get(1);
+check("12d the copy opens with its own image", image?.nodeName === "imageComponent" && image.getAttribute("src") === haloAsset,
+  `${image?.nodeName} ${image?.getAttribute?.("src")}`);
+closeEditor(editorD);
+
 console.log(failures ? `${failures} FAILED` : "ALL PASSED");
 process.exit(failures ? 1 : 0);

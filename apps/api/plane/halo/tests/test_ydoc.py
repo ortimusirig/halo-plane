@@ -264,3 +264,17 @@ def test_formatting_removed_inside_a_formatted_run_is_removed():
         edit = ydoc.edit_document(old, new_body=new)
         assert edit.changed, new_runs
         assert _runs(edit.state) == _runs(new), new_runs
+
+
+
+def test_image_sources_are_listed_and_repointed_without_touching_anything_else():
+    old = page(p("Alpha"), ("imageComponent", {"src": "asset-1", "width": "35%"}, []), p("Beta"),
+               ("imageComponent", {"src": "https://example.com/x.png"}, []))
+    assert ydoc.image_sources(old) == ["asset-1", "https://example.com/x.png"]
+    new = ydoc.with_image_sources(old, {"asset-1": "asset-2"})
+    assert ydoc.image_sources(new) == ["asset-2", "https://example.com/x.png"]
+    doc = Doc()
+    doc.apply_update(new)
+    image = doc.get(ydoc.BODY, type=XmlFragment).children[1]
+    assert dict(image.attributes) == {"src": "asset-2", "width": "35%"}
+    assert text_of(new).replace("asset-2", "asset-1") == text_of(old)

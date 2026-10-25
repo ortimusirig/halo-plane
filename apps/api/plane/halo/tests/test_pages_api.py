@@ -691,17 +691,33 @@ def test_a_failed_copy_task_still_removes_the_mark(world):
     assert Page.objects.get(pk=copy.pk).description_html == IMAGE_HTML
 
 
-def test_duplicate_works_as_in_plane_while_the_text_is_behind(world, api_client):
-    """Owner rule: Plane's duplicate is never refused (it copies the stored HTML, as in stock Plane)."""
+def test_duplicate_of_a_page_whose_html_lags_takes_its_document(world, api_client):
+    """Plane's duplicate is never refused. While the source's stored HTML lags its document, the copy takes the
+    document (the authoritative part, with the latest text) and the same mark, instead of the stale HTML alone."""
     from django.utils import timezone
 
     from plane.halo.models import PageTextBehind
 
+    latest = doc_for(["Alpha", "Beta, typed in the editor", "Gamma"])
+    Page.objects.filter(pk=world.public.pk).update(description_binary=latest)
     PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now())
     api_client.force_authenticate(user=world.owner.user)
     response = api_client.post(_app_page_url(world, "duplicate/"))
     assert response.status_code == 201, response.content
-    assert Page.objects.get(pk=response.json()["id"]).description_html == ORIGINAL
+    copy = Page.objects.get(pk=response.json()["id"])
+    assert bytes(copy.description_binary) == latest
+    assert PageTextBehind.objects.filter(page_id=copy.id).exists()
+    assert world.owner.client.get(f"{world.base}{copy.id}/").json()["text_complete"] is False
+
+
+def test_duplicate_of_an_up_to_date_page_is_rebuilt_from_its_html_as_in_plane(world, api_client):
+    from plane.halo.models import PageTextBehind
+
+    api_client.force_authenticate(user=world.owner.user)
+    response = api_client.post(_app_page_url(world, "duplicate/"))
+    copy = Page.objects.get(pk=response.json()["id"])
+    assert copy.description_binary is None
+    assert not PageTextBehind.objects.filter(page_id=copy.id).exists()
 
 
 def test_duplicate_keeps_plane_s_private_page_rule(world, api_client):
@@ -842,3 +858,38 @@ def test_a_save_of_empty_html_alone_marks_the_text_as_behind(world, api_client):
     api_client.force_authenticate(user=world.owner.user)
     assert api_client.patch(_description_url(world), {"description_html": ""}, format="json").status_code == 200
     assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
+
+
+
+def _copy_with_document(world):
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+
+    copy = world.make_page(world.owner, "Plan (Copy)", IMAGE_HTML)  # make_page builds its document
+    PageBeingCopied.objects.create(page_id=copy.id, since=timezone.now())
+    return copy
+
+
+def test_copy_task_points_the_copied_document_at_the_copied_images(world):
+    copy = _copy_with_document(world)
+    assert ydoc.image_sources(bytes(copy.description_binary)) == ["old-asset"]
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED):
+        _finish(world, copy)
+    after = Page.objects.get(pk=copy.pk)
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
+    assert 'src="new-asset"' in after.description_html
+
+
+def test_copy_task_leaves_a_copied_document_someone_changed_meanwhile(world):
+    copy = _copy_with_document(world)
+    edited = doc_for(["Edited", ("image", "old-asset")])
+
+    def copy_assets(*args):
+        Page.objects.filter(pk=copy.pk).update(description_binary=edited)
+        return COPIED
+
+    with patch("plane.halo.tasks.copy_assets", side_effect=copy_assets):
+        _finish(world, copy)
+    after = Page.objects.get(pk=copy.pk)
+    assert bytes(after.description_binary) == edited and after.description_html == IMAGE_HTML

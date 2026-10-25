@@ -291,10 +291,12 @@ class HaloAppPageViewSet(PageViewSet):
 
 
 class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
-    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps and answers), with two changes. The source
-    page is locked while it is copied. The copy task is Halo's finish_page_copy, which changes only the copy's HTML
-    (Plane's task saves the whole page it read, which could undo an API edit). Until it has run, the copy is marked
-    as being copied: API edits are refused, and editors' loads wait a moment so the images are copied first."""
+    """Plane's duplicate (PageDuplicateEndpoint.post, the same steps and answers), with three changes. The source
+    page is locked while it is copied. When the source's stored HTML lags its document (halo_page_text_behind),
+    the copy takes the document, the authoritative part, instead of being rebuilt from that HTML, and the same
+    mark. The copy task is Halo's finish_page_copy, which changes only the copy's text (Plane's task saves the
+    whole page it read, which could undo an API edit). Until it has run, the copy is marked as being copied: API
+    edits are refused, and editors' loads wait a moment so the images are copied first."""
 
     def post(self, request, slug, project_id, page_id):
         with transaction.atomic():
@@ -304,9 +306,11 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
             if page.access == Page.PRIVATE_ACCESS and page.owned_by_id != request.user.id:
                 return Response({"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN)
             project_ids = list(ProjectPage.objects.filter(page_id=page_id).values_list("project_id", flat=True))
+            behind = bool(page.description_binary) and text_behind(page_id)
             page.pk = None
             page.name = f"{page.name} (Copy)"
-            page.description_binary = None
+            if not behind:
+                page.description_binary = None
             page.owned_by = request.user
             page.created_by = request.user
             page.updated_by = request.user
@@ -320,6 +324,8 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
                     updated_by_id=page.updated_by_id,
                 )
             PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
+            if behind:
+                PageTextBehind.objects.create(page_id=page.id, since=timezone.now())
         _queue(page_transaction, new_description_html=page.description_html, old_description_html=None, page_id=page.id)
         # Plane passes the last project of the loop to its copy task; so does Halo.
         if not _queue(finish_page_copy, page_id=page.id, project_id=project_id, user_id=request.user.id):

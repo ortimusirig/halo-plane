@@ -17,10 +17,13 @@ from urllib.parse import urljoin
 
 import redis
 import requests
+from django.conf import settings
 
 from plane.settings.redis import redis_instance
 
-LIVE_URL = os.environ.get("HALO_LIVE_URL", "http://live:3000/live/")
+# HALO_LIVE_URL, else Plane's own setting (LIVE_BASE_URL plus LIVE_BASE_PATH), else live on Plane's compose network.
+LIVE_URL = os.environ.get("HALO_LIVE_URL") or getattr(settings, "LIVE_URL", None) or "http://live:3000/live/"
+LIVE_URL = LIVE_URL if LIVE_URL.endswith("/") else LIVE_URL + "/"
 CHANNEL_PREFIX = "hocuspocus"
 IDENTIFIER = b"halo-api"  # live skips only messages that carry its own identifier
 SYNC = 0  # Hocuspocus MessageType.Sync
