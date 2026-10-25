@@ -170,7 +170,7 @@ for node in ast.parse(src).body:
         print(" ".join(digest(item) for item in node.body if isinstance(item, ast.FunctionDef)))
     elif isinstance(node, ast.FunctionDef) and node.name == sys.argv[2]:
         print(digest(node))
-' "$work/apps/api/plane/$1" "$2"
+' "$work/apps/api/plane/$1" "$2" | tr -d ''  # Python on Windows ends lines with CR LF
 }
 mirrored() {  # <class> <expected fingerprint> <route suffix> <Halo class> [method]: Halo's subclass copies that code
   local found
