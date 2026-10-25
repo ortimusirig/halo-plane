@@ -266,3 +266,14 @@ def test_a_page_never_opened_is_refused_and_nothing_is_converted(world, fake_liv
     assert (refused.value.status, refused.value.code) == (409, "page_not_ready")
     assert fake_live.calls == []
     assert Page.objects.get(pk=page.pk).description_binary is None
+
+
+@pytest.mark.django_db
+def test_a_page_opened_while_its_edit_was_converted_is_left_alone(world, fake_live):
+    """The open-page check runs again under the row lock, right before the edit (after the conversion)."""
+    with patch("plane.halo.live.is_open", side_effect=[False, True]):
+        with pytest.raises(edit.EditRefused) as refused:
+            _edit(world, html="<p>Alpha</p><p>Beta, replaced</p><p>Gamma</p>")
+    assert (refused.value.status, refused.value.code) == (409, "page_open")
+    assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
+    assert not PageVersion.objects.filter(page=world.public).exists()

@@ -31,7 +31,7 @@ from plane.app.serializers import PageBinaryUpdateSerializer, PageDetailSerializ
 from plane.app.views.page.base import PageDuplicateEndpoint, PagesDescriptionViewSet, PageViewSet
 from plane.app.views.page.version import PageVersionEndpoint
 from plane.bgtasks.page_transaction_task import page_transaction
-from plane.db.models import Page, PageVersion, Project, ProjectMember, ProjectPage
+from plane.db.models import Page, PageLog, PageVersion, Project, ProjectMember, ProjectPage
 from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
 
@@ -83,6 +83,17 @@ def _queue(task, **kwargs) -> bool:
     except Exception as error:
         log_exception(error)
         return False
+
+
+def _indexed_html(page_id) -> str:
+    """The page's entries in Plane's mention index (PageLog), written as the HTML page_transaction reads: as the
+    "old" text of an indexing, everything indexed and no longer in the new text is removed, anything new added."""
+    parts = []
+    for transaction_id, entity_name in PageLog.objects.filter(page_id=page_id).values_list("transaction",
+                                                                                         "entity_name"):
+        tag = "image-component" if entity_name == "image" else "mention-component"
+        parts.append(f'<{tag} id="{transaction_id}"></{tag}>')
+    return "".join(parts)
 
 
 def _guest_limited(request, slug, project_id) -> bool:
@@ -463,28 +474,21 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             # What was written, as Plane's serializer saw it (an empty value is written too).
             html_saved = "description_html" in serializer.validated_data
             document_saved = "description_binary" in serializer.validated_data
-            mark = PageTextBehind.objects.filter(page_id=page.pk).first()
-            indexed_html = old_description_html  # what Plane's mention index saw last
+            index_against = old_description_html  # Plane's way: the stored HTML before this save
             if merged or html_saved != document_saved:
                 # The stored HTML and document disagree (a merged save, or a save of only one of them): marked
-                # until a complete save, of both the whole document and its HTML. A merged save is not indexed
-                # (its HTML lacks what the editor missed), so the mark keeps the HTML the index last saw.
-                if mark is None:
-                    PageTextBehind.objects.create(page_id=page.pk, since=timezone.now(),
-                                                  indexed_html=old_description_html if merged else None)
-                elif merged and mark.indexed_html is None:
-                    mark.indexed_html = old_description_html
-                    mark.save(update_fields=["indexed_html"])
-            elif document_saved and mark is not None:
-                if mark.indexed_html is not None:
-                    indexed_html = mark.indexed_html
-                mark.delete()
+                # until a complete save, of both the whole document and its HTML.
+                PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
+            elif document_saved and PageTextBehind.objects.filter(page_id=page.pk).delete()[0]:
+                # The first complete save after the text lagged: the stored HTML is no record of what Plane's
+                # index holds (merged saves are not indexed), so the index is brought in line with its own rows.
+                index_against = _indexed_html(page.pk)
             if data.get("description_html") and not merged:
-                # Plane's index compares against the HTML it saw last: after merged saves, the one kept in the
-                # mark, so mentions removed or added meanwhile are all taken in.
+                # A merged save's HTML lacks what the editor missed (an API edit's mentions or embeds), so it is
+                # not indexed; the editor's next, complete save indexes the whole text.
                 new_html = data["description_html"]
                 transaction.on_commit(lambda: _queue(
-                    page_transaction, new_description_html=new_html, old_description_html=indexed_html,
+                    page_transaction, new_description_html=new_html, old_description_html=index_against,
                     page_id=page_id))
             if not merged:
                 # A merged save's HTML is that editor's older text, so it makes no version; the editor's next

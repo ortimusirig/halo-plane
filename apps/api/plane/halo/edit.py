@@ -88,6 +88,8 @@ def first_document(html: str, name: str, timeout: float = live.CONVERT_SECONDS) 
     return ydoc.with_title(binary, name or ""), json_data
 
 
+PAGE_OPEN = (409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
+
 NOT_OPENED = (
     409,
     "page_not_ready",
@@ -184,7 +186,7 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
     if not _has_document(page.id):
         raise EditRefused(*NOT_OPENED)
     if live.is_open(page.id):
-        raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
+        raise EditRefused(*PAGE_OPEN)
     clean = new_body = new_json = None
     if restore_from is not None:
         # The version's own document, not its HTML: nothing in it passes through the sanitizer or converter.
@@ -210,6 +212,9 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
             raise EditRefused(*BEING_COPIED)
         if not page.description_binary:  # never edit a page without its document (live builds it on first open)
             raise EditRefused(*NOT_OPENED)
+        # Again, right before the edit: someone may have opened the page while its HTML was being converted.
+        if live.is_open(page.id):
+            raise EditRefused(*PAGE_OPEN)
         old = {
             "description_html": page.description_html,
             "description_binary": page.description_binary,

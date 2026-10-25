@@ -1129,6 +1129,52 @@ def test_mentions_removed_in_a_merged_save_leave_plane_s_index(world, fake_live,
             "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"}, format="json")
     assert complete.status_code == 200
     indexing = [call.kwargs for call in no_celery.call_args_list if "new_description_html" in call.kwargs]
-    assert len(indexing) == 1 and mention in indexing[0]["old_description_html"]
+    # Indexed against what Plane's index holds (its rows), not the merged save's stored HTML.
+    assert len(indexing) == 1 and 'id="0c0c0c0c-0000-4000-8000-0000000000cc"' in indexing[0]["old_description_html"]
     page_transaction(**indexing[0])
     assert not PageLog.objects.filter(page_id=world.public.id, transaction="0c0c0c0c-0000-4000-8000-0000000000cc").exists()
+
+
+def test_a_mention_indexed_between_a_merged_and_a_complete_save_is_removed_when_gone(
+        world, fake_live, api_client, no_celery, django_capture_on_commit_callbacks):
+    """An HTML-only save between them indexes a new mention; the complete save that no longer has it removes
+    its row, because it is indexed against the index's own rows."""
+    from plane.bgtasks.page_transaction_task import page_transaction
+    from plane.db.models import PageLog
+
+    new_mention = ('<mention-component id="0e0e0e0e-0000-4000-8000-0000000000ee" entity_name="user_mention" '
+                   'entity_identifier="0d0d0d0d-0000-4000-8000-0000000000dd"></mention-component>')
+
+    def run_indexing():
+        for call in no_celery.call_args_list:
+            if "new_description_html" in call.kwargs:
+                page_transaction(**call.kwargs)
+        no_celery.reset_mock()
+
+    stale = Doc()
+    stale.apply_update(bytes(world.public.description_binary))
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    assert world.owner.client.patch(url, {"append_html": "<p>Delta by AURA</p>", "expected_updated_at": stamp},
+                                    format="json").status_code == 200
+    no_celery.reset_mock()
+    api_client.force_authenticate(user=world.owner.user)
+    published = []
+    with patch("plane.halo.live.publish_update", side_effect=lambda page_id, update: published.append(update) or 1),             django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": ORIGINAL}, format="json").status_code == 200  # merged
+    run_indexing()
+    with django_capture_on_commit_callbacks(execute=True):  # HTML only, with a new mention
+        assert api_client.patch(_description_url(world), {
+            "description_html": f"<p>Alpha</p><p>Beta {new_mention}</p><p>Gamma</p>"}, format="json").status_code == 200
+    run_indexing()
+    assert PageLog.objects.filter(page_id=world.public.id, transaction="0e0e0e0e-0000-4000-8000-0000000000ee").exists()
+    stale.apply_update(published[0])
+    with django_capture_on_commit_callbacks(execute=True):  # complete, without the mention
+        assert api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": "<p>Alpha</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"}, format="json").status_code == 200
+    run_indexing()
+    assert not PageLog.objects.filter(page_id=world.public.id,
+                                      transaction="0e0e0e0e-0000-4000-8000-0000000000ee").exists()
