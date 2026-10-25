@@ -695,17 +695,26 @@ def test_duplicate_of_a_page_whose_html_lags_takes_its_document(world, api_clien
     """Plane's duplicate is never refused. While the source's stored HTML lags its document, the copy takes the
     document (the authoritative part, with the latest text) and the same mark, instead of the stale HTML alone."""
     from django.utils import timezone
+    from pycrdt import XmlElement, XmlText
 
     from plane.halo.models import PageTextBehind
 
-    latest = doc_for(["Alpha", "Beta, typed in the editor", "Gamma"])
+    document = Doc()
+    document.apply_update(doc_for(["Alpha", "Beta, typed in the editor", "Gamma"]))
+    with document.transaction():
+        heading = document.get(ydoc.TITLE, type=XmlFragment).children.append(XmlElement("heading", {"level": 1.0}))
+        heading.children.append(XmlText()).insert(0, "Plan")
+    latest = document.get_update()
     Page.objects.filter(pk=world.public.pk).update(description_binary=latest)
     PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now())
     api_client.force_authenticate(user=world.owner.user)
     response = api_client.post(_app_page_url(world, "duplicate/"))
     assert response.status_code == 201, response.content
     copy = Page.objects.get(pk=response.json()["id"])
-    assert bytes(copy.description_binary) == latest
+    assert ydoc.body_signature(bytes(copy.description_binary)) == ydoc.body_signature(latest)
+    copied = Doc()
+    copied.apply_update(bytes(copy.description_binary))
+    assert str(copied.get(ydoc.TITLE, type=XmlFragment)).endswith(">Plan (Copy)</heading>")
     assert PageTextBehind.objects.filter(page_id=copy.id).exists()
     assert world.owner.client.get(f"{world.base}{copy.id}/").json()["text_complete"] is False
 

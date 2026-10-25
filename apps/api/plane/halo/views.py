@@ -309,7 +309,10 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
             behind = bool(page.description_binary) and text_behind(page_id)
             page.pk = None
             page.name = f"{page.name} (Copy)"
-            if not behind:
+            if behind:
+                # The document's own title is the source's; the copy's name goes there, the body stays as it is.
+                page.description_binary = ydoc.edit_document(bytes(page.description_binary), name=page.name).state
+            else:
                 page.description_binary = None
             page.owned_by = request.user
             page.created_by = request.user
