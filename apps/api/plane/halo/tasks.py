@@ -60,18 +60,21 @@ def _indexed_html(page_id) -> str:
 
 
 @shared_task
-def reindex_page(page_id):
-    """Plane's mention index brought in line with the page's stored text, both read when the task runs: queued
-    after the indexing tasks of earlier saves, it runs after them in queue order (as Plane's own indexing relies
-    on), so whatever they added or kept and the text no longer has is removed, and anything missing is added.
-    Queued by the save that clears a page's mark (views.HaloPagesDescriptionViewSet), since merged saves are not
-    indexed."""
-    page = Page.objects.filter(pk=page_id).only("description_html").first()
-    if page is None:
-        return
-    # Called directly, Plane's task runs here.
-    page_transaction(new_description_html=page.description_html or "", old_description_html=_indexed_html(page_id),
-                     page_id=page_id)
+def index_page(page_id):
+    """Plane's mention index (PageLog) brought in line with the page's stored text, both read when the job runs,
+    under the page's row lock. Jobs for one page run one at a time, and each leaves the index matching the text
+    at that moment, so neither their order nor workers running them side by side matter: the last job, run
+    after the last save, sees the latest text. Halo's saves queue this in place of Plane's page_transaction,
+    whose diff of two texts an out-of-order or concurrent job can leave wrong. A page whose stored text is a
+    merged save's (lacking what that editor missed) is left alone; the save that clears that mark queues this
+    job again."""
+    with transaction.atomic():
+        page = Page.objects.select_for_update().filter(pk=page_id).only("description_html").first()
+        if page is None or PageTextBehind.objects.filter(page_id=page_id, merged=True).exists():
+            return
+        # Called directly, Plane's task runs here: what is indexed and not in the text goes, anything new comes.
+        page_transaction(new_description_html=page.description_html or "",
+                         old_description_html=_indexed_html(page_id), page_id=page_id)
 
 
 @shared_task

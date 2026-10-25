@@ -30,7 +30,6 @@ from plane.app.permissions import ROLE
 from plane.app.serializers import PageBinaryUpdateSerializer, PageDetailSerializer, PageSerializer
 from plane.app.views.page.base import PageDuplicateEndpoint, PagesDescriptionViewSet, PageViewSet
 from plane.app.views.page.version import PageVersionEndpoint
-from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page, PageVersion, Project, ProjectMember, ProjectPage
 from plane.utils.error_codes import ERROR_CODES
 from plane.utils.exception_logger import log_exception
@@ -38,7 +37,7 @@ from plane.utils.exception_logger import log_exception
 from . import live, ydoc
 from .edit import EditRefused, edit_page, first_document, sanitize, text_behind
 from .models import PageBeingCopied, PageTextBehind
-from .tasks import finish_page_copy, reindex_page, track_page_version_after_save
+from .tasks import finish_page_copy, index_page, track_page_version_after_save
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -181,7 +180,7 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
             # The page and its project link (PageSerializer.create) commit together, and only with the answer.
             serializer.save()
             data = PageDetailSerializer(self.get_queryset().get(pk=serializer.data["id"])).data
-        _queue(page_transaction, new_description_html=html, old_description_html=None, page_id=data["id"])
+        _queue(index_page, page_id=data["id"])
         data["url"] = page_url(slug, project_id, data["id"])
         data.update(_editability(reason is None, reason))
         return Response(data, status=status.HTTP_201_CREATED)
@@ -296,7 +295,7 @@ class HaloAppPageViewSet(PageViewSet):
 
     def partial_update(self, request, slug, project_id, page_id):
         """Plane's PageViewSet.partial_update (the same checks, serializer and answers; fingerprinted by the
-        upgrade gate) under the page's row lock, with its page_transaction task queued after commit, so a broker
+        upgrade gate) under the page's row lock, with its index job queued after commit, so a broker
         failure cannot undo the save. It writes description_html without the document, as in Plane (the web app's
         store sends its whole copy of the page); when that changes the HTML the page is marked, so Halo's API
         reports text_complete false and waits for the next complete editor save."""
@@ -325,10 +324,8 @@ class HaloAppPageViewSet(PageViewSet):
                     if page.description_html != page_description:
                         PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
                     if request.data.get("description_html"):
-                        new_html = request.data.get("description_html", "<p></p>")
-                        transaction.on_commit(lambda: _queue(
-                            page_transaction, new_description_html=new_html, old_description_html=page_description,
-                            page_id=page_id))
+                        # Halo's index job (tasks.index_page) in place of Plane's page_transaction diff.
+                        transaction.on_commit(lambda: _queue(index_page, page_id=page_id))
                     return Response(serializer.data, status=status.HTTP_200_OK)
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             except Page.DoesNotExist:
@@ -392,7 +389,7 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
             PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
             if behind:
                 PageTextBehind.objects.create(page_id=page.id, since=timezone.now())
-        _queue(page_transaction, new_description_html=page.description_html, old_description_html=None, page_id=page.id)
+        _queue(index_page, page_id=page.id)
         # Plane passes the last project of the loop to its copy task; so does Halo.
         if not _queue(finish_page_copy, page_id=page.id, project_id=project_id, user_id=request.user.id):
             # No copy task will run: the copy is usable at once and keeps showing the original's images.
@@ -463,25 +460,22 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             # What was written, as Plane's serializer saw it (an empty value is written too).
             html_saved = "description_html" in serializer.validated_data
             document_saved = "description_binary" in serializer.validated_data
-            reindex = False
-            if merged or html_saved != document_saved:
-                # The stored HTML and document disagree (a merged save, or a save of only one of them): marked
-                # until a complete save, of both the whole document and its HTML.
-                PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
-            elif document_saved and PageTextBehind.objects.filter(page_id=page.pk).delete()[0]:
-                # The first complete save after the text lagged: merged saves were not indexed, so instead of
-                # Plane's diff against the stored HTML, the index is reconciled with the whole text in the worker,
-                # after the indexing tasks queued before it (tasks.reindex_page).
-                reindex = True
-            if reindex:
-                transaction.on_commit(lambda: _queue(reindex_page, page_id=page_id))
-            elif data.get("description_html") and not merged:
-                # A merged save's HTML lacks what the editor missed (an API edit's mentions or embeds), so it is
-                # not indexed; the editor's next, complete save reconciles the whole text.
-                new_html = data["description_html"]
-                transaction.on_commit(lambda: _queue(
-                    page_transaction, new_description_html=new_html, old_description_html=old_description_html,
-                    page_id=page_id))
+            cleared = False
+            if merged:
+                # The stored HTML is now that editor's older text: marked (merged) until a complete save, and not
+                # indexed meanwhile (it lacks an API edit's mentions or embeds).
+                PageTextBehind.objects.update_or_create(page_id=page.pk,
+                                                        defaults={"since": timezone.now(), "merged": True})
+            elif html_saved != document_saved:
+                # A save of only one of HTML and document: marked until a complete save (an earlier merged mark
+                # stays as it is).
+                PageTextBehind.objects.get_or_create(page_id=page.pk, defaults={"since": timezone.now()})
+            elif document_saved:
+                cleared = bool(PageTextBehind.objects.filter(page_id=page.pk).delete()[0])
+            if not merged and (data.get("description_html") or cleared):
+                # Halo's index job (tasks.index_page) in place of Plane's page_transaction diff: it brings the
+                # index in line with the stored text when it runs, whatever order jobs run in.
+                transaction.on_commit(lambda: _queue(index_page, page_id=page_id))
             if not merged:
                 # A merged save's HTML is that editor's older text, so it makes no version; the editor's next
                 # save, complete because it received the missing part, does.

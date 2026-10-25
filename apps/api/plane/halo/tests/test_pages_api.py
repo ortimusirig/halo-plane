@@ -356,7 +356,7 @@ def test_editor_save_starts_version_tasks_only_after_commit(world, api_client, n
             "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p>"}, format="json")
         assert response.status_code == 200
         no_celery.assert_not_called()  # nothing queued while the save is not committed
-    assert len(callbacks) == 2  # page_transaction and track_page_version, once committed
+    assert len(callbacks) == 2  # the index job and the version task, once committed
     for callback in callbacks:
         callback()
     assert no_celery.call_count == 2
@@ -518,8 +518,8 @@ def test_create_commits_nothing_when_the_answer_cannot_be_built(world, no_celery
         response = world.owner.client.post(world.base, {"name": "New"}, format="json")
     assert response.status_code == 404
     assert Page.objects.count() == pages
-    # No page task queued (Plane's API request log task may be).
-    assert not any("new_description_html" in call.kwargs for call in no_celery.call_args_list)
+    # No index job queued (Plane's API request log task may be).
+    assert not any(set(call.kwargs) == {"page_id"} for call in no_celery.call_args_list)  # no index job
 
 
 def test_duplicate_is_halo_s_and_marks_the_copy_until_its_copy_task_ran(world, api_client, no_celery):
@@ -736,8 +736,8 @@ def test_a_save_of_html_alone_marks_the_text_as_behind(world, api_client):
 
 def test_create_answers_201_once_although_the_broker_is_down(world):
     pages = Page.objects.count()
-    with patch("plane.halo.views.page_transaction") as page_transaction:
-        page_transaction.delay.side_effect = RuntimeError("broker down")
+    with patch("plane.halo.views.index_page") as index_page:
+        index_page.delay.side_effect = RuntimeError("broker down")
         response = world.owner.client.post(world.base, {"name": "New"}, format="json")
     assert response.status_code == 201, response.content
     assert Page.objects.count() == pages + 1
@@ -810,8 +810,8 @@ def test_web_app_properties_patch_is_saved_although_the_broker_is_down(world, ap
     from plane.halo.models import PageTextBehind
 
     api_client.force_authenticate(user=world.owner.user)
-    with patch("plane.halo.views.page_transaction") as page_transaction:
-        page_transaction.delay.side_effect = RuntimeError("broker down")
+    with patch("plane.halo.views.index_page") as index_page:
+        index_page.delay.side_effect = RuntimeError("broker down")
         response = api_client.patch(_app_page_url(world), {"name": "Renamed", "description_html": "<p>New text</p>"},
                                     format="json")
     assert response.status_code == 200, response.content
@@ -1100,22 +1100,21 @@ def _mention(mention_id):
     return f'<mention-component id="{mention_id}" entity_name="user_mention" entity_identifier="{TARGET}"></mention-component>'
 
 
-def _run_queued(no_celery):
-    """Run the queued page tasks in queue order, as the worker does: Plane's page_transaction and Halo's
-    reindex_page (the other queued tasks do not touch the index)."""
-    from plane.bgtasks.page_transaction_task import page_transaction
-    from plane.halo.tasks import reindex_page
-
-    ran = []
-    for call in no_celery.call_args_list:
-        if "new_description_html" in call.kwargs:
-            page_transaction(**call.kwargs)
-            ran.append("page_transaction")
-        elif set(call.kwargs) == {"page_id"}:
-            reindex_page(**call.kwargs)
-            ran.append("reindex_page")
+def _index_jobs(no_celery):
+    """The index jobs queued so far (Halo's index_page), cleared from the mock."""
+    jobs = [call.kwargs for call in no_celery.call_args_list if set(call.kwargs) == {"page_id"}]
     no_celery.reset_mock()
-    return ran
+    return jobs
+
+
+def _run_queued(no_celery, reverse=False):
+    """Run the queued index jobs, in queue order or the reverse (as concurrent workers may)."""
+    from plane.halo.tasks import index_page
+
+    jobs = _index_jobs(no_celery)
+    for kwargs in reversed(jobs) if reverse else jobs:
+        index_page(**kwargs)
+    return ["index_page"] * len(jobs)
 
 
 def _merged_save(world, api_client, stale, html):
@@ -1160,7 +1159,7 @@ def test_mentions_removed_in_a_merged_save_leave_plane_s_index(world, fake_live,
             "description_binary": base64.b64encode(stale.get_update()).decode(),
             "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"},
             format="json").status_code == 200
-    assert _run_queued(no_celery) == ["reindex_page"]  # the merged save queued no indexing
+    assert _run_queued(no_celery) == ["index_page"]  # the merged save queued no indexing
     assert not PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
 
 
@@ -1185,5 +1184,59 @@ def test_a_mention_indexed_between_a_merged_and_a_complete_save_is_removed_when_
             "description_binary": base64.b64encode(stale.get_update()).decode(),
             "description_html": "<p>Alpha</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"},
             format="json").status_code == 200
-    assert _run_queued(no_celery) == ["page_transaction", "reindex_page"]
+    assert _run_queued(no_celery) == ["index_page", "index_page"]
     assert not PageLog.objects.filter(page_id=world.public.id, transaction=NEW_MENTION_ID).exists()
+
+
+def test_index_jobs_leave_the_index_matching_the_text_in_any_order(world, fake_live, api_client, no_celery,
+                                                                     django_capture_on_commit_callbacks):
+    """An HTML-only save adds a mention, a complete save removes it; the two jobs run in reverse order, as two
+    workers may finish them: the index still ends without the mention."""
+    from plane.db.models import PageLog
+
+    current = Doc()
+    current.apply_update(bytes(world.public.description_binary))
+    api_client.force_authenticate(user=world.owner.user)
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {
+            "description_html": f"<p>Alpha</p><p>Beta {_mention(NEW_MENTION_ID)}</p><p>Gamma</p>"},
+            format="json").status_code == 200
+        assert api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(current.get_update()).decode(),
+            "description_html": ORIGINAL}, format="json").status_code == 200
+    assert len(_run_queued(no_celery, reverse=True)) == 2
+    assert not PageLog.objects.filter(page_id=world.public.id, transaction=NEW_MENTION_ID).exists()
+
+
+def test_an_index_job_leaves_a_page_alone_while_a_merged_save_s_text_is_stored(world, fake_live, api_client,
+                                                                                no_celery,
+                                                                                django_capture_on_commit_callbacks):
+    """A complete save queues an index job; another stale editor's merged save lands before it runs. The job must
+    not index that older text (it would drop mentions the document has); the next complete save's job does."""
+    from plane.bgtasks.page_transaction_task import page_transaction
+    from plane.db.models import PageLog
+
+    with_mention = f"<p>Alpha</p><p>Beta {_mention(MENTION_ID)}</p><p>Gamma</p>"
+    Page.objects.filter(pk=world.public.pk).update(description_html=with_mention)
+    page_transaction(new_description_html=with_mention, old_description_html=None, page_id=world.public.id)
+    stale = Doc()
+    stale.apply_update(bytes(world.public.description_binary))
+    _api_append(world)
+    no_celery.reset_mock()
+    current = Doc()
+    current.apply_update(bytes(Page.objects.get(pk=world.public.pk).description_binary))
+    api_client.force_authenticate(user=world.owner.user)
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {  # complete, keeps the mention
+            "description_binary": base64.b64encode(current.get_update()).decode(),
+            "description_html": with_mention + "<p>Delta by AURA</p>"}, format="json").status_code == 200
+        missing = _merged_save(world, api_client, stale, ORIGINAL)  # older text, without the mention
+    assert _run_queued(no_celery) == ["index_page"]  # the complete save's job, run after the merged save
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+    stale.apply_update(missing)
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": with_mention + "<p>Delta by AURA</p>"}, format="json").status_code == 200
+    assert _run_queued(no_celery) == ["index_page"]
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()

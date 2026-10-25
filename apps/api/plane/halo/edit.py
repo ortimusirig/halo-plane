@@ -18,13 +18,13 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page
 from plane.utils.content_validator import validate_binary_data, validate_html_content
 from plane.utils.exception_logger import log_exception
 
 from . import lease, live, versions, ydoc
 from .models import PageBeingCopied, PageTextBehind
+from .tasks import index_page
 
 REPUBLISH_AFTER_SECONDS = 3
 
@@ -260,9 +260,7 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         timer.start()
     if body_changed:
         try:
-            page_transaction.delay(
-                new_description_html=full_html, old_description_html=old["description_html"], page_id=page.id
-            )
+            index_page.delay(page_id=page.id)
         except Exception as error:  # the mentions index only; the edit itself is saved
             log_exception(error)
     return {
