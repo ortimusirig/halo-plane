@@ -54,6 +54,17 @@ async function api(method, path, body) {
   }
 }
 
+// A web-app POST (signed in with the session cookie). It is not safe to send twice, so a read goes first: it
+// replaces a pooled socket the API may have closed while idle (api() sends a read again on that error).
+async function webPost(path, body) {
+  await api("GET", "pages/?per_page=1");
+  return fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/${path}`, {
+    method: "POST",
+    headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
 const textOf = (node) =>
   node instanceof Y.XmlText
     ? node.toDelta().map((d) => (typeof d.insert === "string" ? d.insert : "")).join("")
@@ -225,10 +236,7 @@ check("10 restoring the before version brings the old Beta back",
 // 11. Plane's duplicate from the web app: the copy stays marked until the worker ran Plane's copy task
 // (through Halo's finish_page_copy, so this also proves the worker finds Halo's tasks); then it opens and the
 // API can edit it.
-const duplicated = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${pageId}/duplicate/`, {
-  method: "POST",
-  headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
-});
+const duplicated = await webPost(`pages/${pageId}/duplicate/`);
 const copy = await duplicated.json();
 check("11a duplicate in the web app", duplicated.status === 201 && copy.name === "E2E page (Copy)", JSON.stringify(copy));
 const unmarked = await waitFor(async () =>
@@ -267,10 +275,7 @@ const imageHtml = `<p>Before the image</p><image-component src="${assetId}"></im
 const imaged = await api("POST", "pages/", { name: "E2E image page", description_html: imageHtml });
 check("12a page with an uploaded image", imaged.status === 201 && imaged.data.description_html.includes(assetId),
   JSON.stringify(imaged.data));
-const imageCopyResponse = await fetch(
-  `${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${imaged.data.id}/duplicate/`,
-  { method: "POST", headers: { Cookie: seed.cookie, "Content-Type": "application/json" } },
-);
+const imageCopyResponse = await webPost(`pages/${imaged.data.id}/duplicate/`);
 const imageCopy = await imageCopyResponse.json();
 await waitFor(async () =>
   inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${imageCopy.id}").exists())`)
@@ -314,11 +319,7 @@ closeEditor(editorD);
 
 // 13. A page made in the web app (Plane's own create, no document): API edits are refused until it is opened
 // once; live then converts it itself, as in stock Plane, and the API can edit it.
-const webCreate = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/`, {
-  method: "POST",
-  headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
-  body: JSON.stringify({ name: "Web page", description_html: "<p>Made in the web app</p>" }),
-});
+const webCreate = await webPost("pages/", { name: "Web page", description_html: "<p>Made in the web app</p>" });
 const webPage = await webCreate.json();
 const unopened = await page(webPage.id);
 const notReady = await api("PATCH", `pages/${webPage.id}/`, {
@@ -346,10 +347,7 @@ check("13c once opened, the API edits it", Boolean(webEdit) && webEdit.status ==
 // live) before its copy task runs; then the worker runs the task while the editor is open. The task's change
 // reaches the open editor, and the copy ends with the typing once, no block twice, and its own image.
 execFileSync("docker", [...COMPOSE, "stop", "worker"], { encoding: "utf8" });
-const raceCopyResponse = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${imaged.data.id}/duplicate/`, {
-  method: "POST",
-  headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
-});
+const raceCopyResponse = await webPost(`pages/${imaged.data.id}/duplicate/`);
 const raceCopy = await raceCopyResponse.json();
 const marked = () =>
   inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${raceCopy.id}").exists())`)

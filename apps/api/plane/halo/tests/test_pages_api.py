@@ -553,8 +553,8 @@ def test_duplicate_is_halo_s_and_marks_the_copy_until_its_copy_task_ran(world, a
     assert Page.objects.get(pk=copy.pk).description_html == ORIGINAL  # no images, nothing to change
 
 
-IMAGE_HTML = '<p>Alpha</p><image-component src="old-asset"></image-component>'
-COPIED = [{"old_asset_id": "old-asset", "new_asset_id": "new-asset"}]
+IMAGE_HTML = '<p>Alpha</p><image-component src="0a0a0a0a-0000-4000-8000-0000000000aa"></image-component>'
+COPIED = [{"old_asset_id": "0a0a0a0a-0000-4000-8000-0000000000aa", "new_asset_id": "0b0b0b0b-0000-4000-8000-0000000000bb"}]
 
 
 def _copy_in_progress(world):
@@ -580,9 +580,9 @@ def test_copy_task_points_only_the_copy_s_html_at_the_copied_images(world):
     before = Page.objects.get(pk=copy.pk)
     with patch("plane.halo.tasks.copy_assets", return_value=COPIED) as copy_assets:
         _finish(world, copy)
-    assert copy_assets.call_args.args[1:] == (copy.id, world.project.id, ["old-asset"], world.owner.user.id)
+    assert copy_assets.call_args.args[1:] == (copy.id, world.project.id, ["0a0a0a0a-0000-4000-8000-0000000000aa"], world.owner.user.id)
     after = Page.objects.get(pk=copy.pk)
-    assert 'src="new-asset"' in after.description_html and "old-asset" not in after.description_html
+    assert 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in after.description_html and "0a0a0a0a-0000-4000-8000-0000000000aa" not in after.description_html
     assert after.updated_at > before.updated_at  # a stamp read before the task no longer passes
     assert (after.name, after.description_binary) == ("Plan (Copy)", None)
     assert not PageBeingCopied.objects.filter(page_id=copy.id).exists()
@@ -613,7 +613,7 @@ def test_a_late_copy_task_never_overwrites_what_happened_meanwhile(world, meanwh
     elif meanwhile == "document built":
         assert after.description_html == IMAGE_HTML
     else:
-        assert 'src="new-asset"' in after.description_html
+        assert 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in after.description_html
         assert after.archived_at is not None and after.name == "Renamed meanwhile"
 
 
@@ -783,17 +783,17 @@ def _copy_with_document(world):
 
 def test_copy_task_points_the_copied_document_at_the_copied_images(world):
     copy = _copy_with_document(world)
-    assert ydoc.image_sources(bytes(copy.description_binary)) == ["old-asset"]
+    assert ydoc.image_sources(bytes(copy.description_binary)) == ["0a0a0a0a-0000-4000-8000-0000000000aa"]
     with patch("plane.halo.tasks.copy_assets", return_value=COPIED):
         _finish(world, copy)
     after = Page.objects.get(pk=copy.pk)
-    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
-    assert 'src="new-asset"' in after.description_html
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["0b0b0b0b-0000-4000-8000-0000000000bb"]
+    assert 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in after.description_html
 
 
 def test_copy_task_leaves_a_copied_document_someone_changed_meanwhile(world):
     copy = _copy_with_document(world)
-    edited = doc_for(["Edited", ("image", "old-asset")])
+    edited = doc_for(["Edited", ("image", "0a0a0a0a-0000-4000-8000-0000000000aa")])
 
     def copy_assets(*args):
         Page.objects.filter(pk=copy.pk).update(description_binary=edited)
@@ -991,7 +991,7 @@ def test_duplicate_of_a_page_without_a_document_has_none(world, api_client):
 
 
 IMAGE_JSON = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Alpha"}]},
-                                         {"type": "imageComponent", "attrs": {"src": "old-asset"}}]}
+                                         {"type": "imageComponent", "attrs": {"src": "0a0a0a0a-0000-4000-8000-0000000000aa"}}]}
 
 
 def _copy_with_json(world):
@@ -1007,9 +1007,9 @@ def test_copy_task_repoints_html_json_and_document_and_tells_live(world):
             patch("plane.halo.live.publish_update") as publish:
         _finish(world, copy)
     after = Page.objects.get(pk=copy.pk)
-    assert 'src="new-asset"' in after.description_html
-    assert after.description_json["content"][1]["attrs"]["src"] == "new-asset"
-    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
+    assert 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in after.description_html
+    assert after.description_json["content"][1]["attrs"]["src"] == "0b0b0b0b-0000-4000-8000-0000000000bb"
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["0b0b0b0b-0000-4000-8000-0000000000bb"]
     publish.assert_called_once_with(copy.id, bytes(after.description_binary))
 
 
@@ -1021,15 +1021,15 @@ def test_copy_saved_before_the_task_reads_it_keeps_the_typing_and_gets_the_image
     text.insert(len(text), " typed")
     api_client.force_authenticate(user=world.owner.user)
     url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{copy.id}/description/"
-    html = '<p>Alpha typed</p><image-component src="old-asset"></image-component>'
+    html = '<p>Alpha typed</p><image-component src="0a0a0a0a-0000-4000-8000-0000000000aa"></image-component>'
     assert api_client.patch(url, {"description_binary": base64.b64encode(typed.get_update()).decode(),
                                   "description_html": html}, format="json").status_code == 200
     with patch("plane.halo.tasks.copy_assets", return_value=COPIED), patch("plane.halo.live.publish_update"):
         _finish(world, copy)
     after = Page.objects.get(pk=copy.pk)
-    assert "Alpha typed" in after.description_html and 'src="new-asset"' in after.description_html
-    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
-    assert ydoc.body_signature(ydoc.with_image_sources(bytes(after.description_binary), {"new-asset": "old-asset"})) \
+    assert "Alpha typed" in after.description_html and 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in after.description_html
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["0b0b0b0b-0000-4000-8000-0000000000bb"]
+    assert ydoc.body_signature(ydoc.with_image_sources(bytes(after.description_binary), {"0b0b0b0b-0000-4000-8000-0000000000bb": "0a0a0a0a-0000-4000-8000-0000000000aa"})) \
         == ydoc.body_signature(typed.get_update())
 
 
@@ -1039,8 +1039,8 @@ def test_copy_without_a_document_is_replaced_by_live_s_own_first_save_as_in_plan
     copy = _copy_in_progress(world)  # no document
     with patch("plane.halo.tasks.copy_assets", return_value=COPIED):
         _finish(world, copy)
-    assert 'src="new-asset"' in Page.objects.get(pk=copy.pk).description_html
-    lives_own = doc_for(["Alpha", ("image", "old-asset")])
+    assert 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in Page.objects.get(pk=copy.pk).description_html
+    lives_own = doc_for(["Alpha", ("image", "0a0a0a0a-0000-4000-8000-0000000000aa")])
     api_client.force_authenticate(user=world.owner.user)
     url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{copy.id}/description/"
     assert api_client.patch(url, {"description_binary": base64.b64encode(lives_own).decode(),
@@ -1059,12 +1059,12 @@ def test_an_api_append_after_the_copy_task_keeps_the_copied_images(world, fake_l
                                         format="json")
     assert response.status_code == 200, response.content
     after = Page.objects.get(pk=copy.pk)
-    assert 'src="new-asset"' in after.description_html and "old-asset" not in after.description_html
-    assert after.description_json["content"][1]["attrs"]["src"] == "new-asset"
-    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
+    assert 'src="0b0b0b0b-0000-4000-8000-0000000000bb"' in after.description_html and "0a0a0a0a-0000-4000-8000-0000000000aa" not in after.description_html
+    assert after.description_json["content"][1]["attrs"]["src"] == "0b0b0b0b-0000-4000-8000-0000000000bb"
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["0b0b0b0b-0000-4000-8000-0000000000bb"]
     for version_id in (response.json()["before_version_id"], response.json()["after_version_id"]):
         version = PageVersion.objects.get(pk=version_id)
-        assert "new-asset" in version.description_html and "old-asset" not in version.description_html
+        assert "0b0b0b0b-0000-4000-8000-0000000000bb" in version.description_html and "0a0a0a0a-0000-4000-8000-0000000000aa" not in version.description_html
 
 
 
