@@ -1100,7 +1100,7 @@ def test_mentions_removed_in_a_merged_save_leave_plane_s_index(world, fake_live,
     from plane.bgtasks.page_transaction_task import page_transaction
     from plane.db.models import PageLog
 
-    mention = '<mention-component id="0c0c0c0c-0000-4000-8000-0000000000cc" entity_name="user_mention" entity_identifier="u1"></mention-component>'
+    mention = '<mention-component id="0c0c0c0c-0000-4000-8000-0000000000cc" entity_name="user_mention" entity_identifier="0d0d0d0d-0000-4000-8000-0000000000dd"></mention-component>'
     with_mention = f"<p>Alpha</p><p>Beta {mention}</p><p>Gamma</p>"
     Page.objects.filter(pk=world.public.pk).update(description_html=with_mention)
     page_transaction(new_description_html=with_mention, old_description_html=None, page_id=world.public.id)
