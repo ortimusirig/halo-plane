@@ -111,17 +111,18 @@ async function versionTexts(id) {
 const created = await api("POST", "pages/", { name: "E2E page", description_html: "<p>Alpha</p><p>Beta</p><p>Gamma</p>" });
 check("1 create page through the API", created.status === 201, JSON.stringify(created));
 const pageId = created.data.id;
+// The API create stored the page's first document (nobody could be loading the page then).
+const built = inApi(
+  `from plane.db.models import Page; p = Page.objects.get(pk="${pageId}"); print(bool(p.description_binary))`,
+);
+check("1b the API create stored the page's first document", built.split(/\r?\n/).pop() === "True" &&
+  created.data.text_editable === true, `${built} ${created.data.text_editable}`);
 
-// 2. Editor A opens it; live builds the document from the HTML.
+// 2. Editor A opens it; Plane's own load gives live the stored document.
 const docA = new Y.Doc();
 let editorA = await connect(docA, pageId);
 await waitFor(() => blocks(docA).length === 3);
 check("2 editor opens the page", JSON.stringify(blocks(docA)) === '["Alpha","Beta","Gamma"]', JSON.stringify(blocks(docA)));
-// The first document came from Halo (built from the HTML when live loaded the page), not from live's own conversion.
-const built = inApi(
-  `from plane.db.models import Page; p = Page.objects.get(pk="${pageId}"); print(bool(p.description_binary))`,
-);
-check("2b Halo built the page's first document", built.split(/\r?\n/).pop() === "True", built);
 check("2c the first document has the page's title", textOf(docA.getXmlFragment("title")) === "E2E page",
   textOf(docA.getXmlFragment("title")));
 
@@ -310,6 +311,62 @@ const image = docD.getXmlFragment("default").get(1);
 check("12d the copy opens with its own image", image?.nodeName === "imageComponent" && image.getAttribute("src") === haloAsset,
   `${image?.nodeName} ${image?.getAttribute?.("src")}`);
 closeEditor(editorD);
+
+// 13. A page made in the web app (Plane's own create, no document): API edits are refused until it is opened
+// once; live then converts it itself, as in stock Plane, and the API can edit it.
+const webCreate = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/`, {
+  method: "POST",
+  headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
+  body: JSON.stringify({ name: "Web page", description_html: "<p>Made in the web app</p>" }),
+});
+const webPage = await webCreate.json();
+const unopened = await page(webPage.id);
+const notReady = await api("PATCH", `pages/${webPage.id}/`, {
+  append_html: "<p>by AURA</p>",
+  expected_updated_at: unopened.updated_at,
+});
+check("13a a never-opened web page says it cannot be edited yet, and an edit is refused",
+  webCreate.status === 201 && unopened.text_editable === false && unopened.text_editable_reason === "not_opened_yet" &&
+    notReady.status === 409 && notReady.data.code === "page_not_ready",
+  `${webCreate.status} ${JSON.stringify(unopened)} ${JSON.stringify(notReady)}`);
+const docW = new Y.Doc();
+const editorW = await connect(docW, webPage.id);
+await waitFor(() => blocks(docW)[0] === "Made in the web app");
+check("13b live converts it on first open", blocks(docW)[0] === "Made in the web app", JSON.stringify(blocks(docW)));
+closeEditor(editorW);
+const opened = await waitFor(async () => (await closed(webPage.id)) && (await page(webPage.id)).text_editable ? await page(webPage.id) : null);
+const webEdit = opened && await api("PATCH", `pages/${webPage.id}/`, {
+  append_html: "<p>by AURA</p>",
+  expected_updated_at: opened.updated_at,
+});
+check("13c once opened, the API edits it", Boolean(webEdit) && webEdit.status === 200 && webEdit.data.changed,
+  JSON.stringify(webEdit?.data ?? opened));
+
+// 14. The copy race: a copy opened and typed in at once, before its copy task may have run. The typing ends up
+// saved once, with no block twice.
+const raceCopyResponse = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${imaged.data.id}/duplicate/`, {
+  method: "POST",
+  headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
+});
+const raceCopy = await raceCopyResponse.json();
+const docR = new Y.Doc();
+const editorR = await connect(docR, raceCopy.id);
+await waitFor(() => docR.getXmlFragment("default").length === 3);
+textAt(docR, 0).insert(textAt(docR, 0).length, " raced");
+await sleep(500);
+closeEditor(editorR);
+const raced = await waitFor(async () => {
+  const done = inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${raceCopy.id}").exists())`)
+    .split(/\r?\n/).pop() === "False";
+  const html = (await page(raceCopy.id)).description_html;
+  return done && (await closed(raceCopy.id)) && html.includes("raced") ? html : null;
+}, 30000);
+const racedBlocks = inApi(
+  `from plane.db.models import Page; from plane.halo import ydoc; print(len(ydoc.body_signature(bytes(Page.objects.get(pk="${raceCopy.id}").description_binary))))`,
+).split(/\r?\n/).pop();
+check("14 a copy typed in before its copy task keeps the typing once, no block twice",
+  Boolean(raced) && (raced.match(/raced/g) ?? []).length === 1 && racedBlocks === "3",
+  `${raced} blocks=${racedBlocks}`);
 
 console.log(failures ? `${failures} FAILED` : "ALL PASSED");
 process.exit(failures ? 1 : 0);

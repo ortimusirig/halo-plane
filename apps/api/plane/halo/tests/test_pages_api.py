@@ -19,6 +19,12 @@ pytestmark = pytest.mark.django_db
 ORIGINAL = "<p>Alpha</p><p>Beta</p><p>Gamma</p>"
 
 
+@pytest.fixture(autouse=True)
+def no_live_unless_faked(monkeypatch):
+    """Tests without fake_live reach no live: connections to it are refused at once."""
+    monkeypatch.setattr("plane.halo.live.LIVE_URL", "http://127.0.0.1:9/live/")
+
+
 def ids(response):
     assert response.status_code == 200, response.content
     return {page["id"] for page in response.json()["results"]}
@@ -62,19 +68,6 @@ def test_private_page_of_someone_else_is_refused(world):
     url = f"{world.base}{world.private.id}/"
     assert world.member.client.get(url).status_code == 403
     assert world.member.client.patch(url, {"name": "x"}, format="json").status_code == 403
-
-
-def test_create_sanitizes_and_leaves_document_empty(world):
-    response = world.member.client.post(
-        world.base, {"name": "Notes", "description_html": "<p>Hi</p><script>alert(1)</script>"}, format="json"
-    )
-    assert response.status_code == 201, response.content
-    page = Page.objects.get(pk=response.json()["id"])
-    assert "<script" not in page.description_html
-    assert page.description_binary is None
-    assert page.owned_by_id == world.member.user.id
-    assert response.json()["url"].endswith(f"/pages/{page.id}")
-    assert ids(world.member.client.get(world.base)) == {str(world.public.id), str(page.id)}
 
 
 def test_create_takes_only_name_text_and_access(world):
@@ -315,27 +308,6 @@ def test_sub_page_edits_are_refused_before_anything_changes(world, fake_live):
     assert not PageVersion.objects.filter(page=child).exists()
 
 
-def test_first_load_of_a_page_too_large_for_the_converter_is_left_to_live(world, fake_live, api_client):
-    page = world.make_page(world.owner, "Big", "<p>big</p>", binary=False)
-    fake_live.too_large = True
-    api_client.force_authenticate(user=world.owner.user)
-    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
-    response = api_client.get(url)
-    assert response.status_code == 200 and b"".join(response.streaming_content) == b""
-    page.refresh_from_db()
-    assert page.description_binary is None  # live converts it itself, as in stock Plane
-
-
-def test_first_load_is_left_to_live_when_the_converter_is_down(world, fake_live, api_client):
-    """Plane's load is never refused: live converts the page itself, as in stock Plane."""
-    page = world.make_page(world.owner, "Fresh", "<p>x</p>", binary=False)
-    fake_live.down = True
-    api_client.force_authenticate(user=world.owner.user)
-    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
-    assert api_client.get(url).status_code == 200
-    assert Page.objects.get(pk=page.pk).description_binary is None
-
-
 def test_a_save_without_html_does_not_clear_the_lagging_mark(world, api_client):
     from django.utils import timezone
 
@@ -388,35 +360,6 @@ def test_editor_save_starts_version_tasks_only_after_commit(world, api_client, n
     assert no_celery.call_count == 2
 
 
-def test_first_load_builds_the_document_from_the_html(world, fake_live, api_client):
-    page = world.make_page(world.owner, "Fresh", "<p>One</p><p>Two</p>", binary=False)
-    before = page.updated_at
-    api_client.force_authenticate(user=world.owner.user)
-    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
-    response = api_client.get(url)
-    assert response.status_code == 200
-    body = b"".join(response.streaming_content)
-    page.refresh_from_db()
-    assert body == bytes(page.description_binary) and body
-    assert ydoc.body_signature(body) == ydoc.body_signature(doc_for(["One", "Two"]))
-    # Plane's own first document holds the name as its title; the browser's offline fallback shows it from there.
-    loaded = Doc()
-    loaded.apply_update(body)
-    assert str(loaded.get(ydoc.TITLE, type=XmlFragment)).endswith(">Fresh</heading>")
-    assert page.updated_at == before  # building the document is not a change
-    assert fake_live.calls == ["<p>One</p><p>Two</p>"]
-
-
-def test_editor_load_goes_on_after_waiting_for_a_long_api_edit(world, api_client):
-    """Plane's load is never refused; an edit that commits later reaches the editor through live."""
-    api_client.force_authenticate(user=world.owner.user)
-    with patch("plane.halo.lease.WAIT_SECONDS", 0.3), lease.edit_lease(world.public.id):
-        started = time.monotonic()
-        response = api_client.get(_description_url(world))
-        waited = time.monotonic() - started
-    assert response.status_code == 200 and waited >= 0.25
-
-
 def test_editor_save_that_knows_everything_is_plane_unchanged(world, api_client):
     current = Doc()
     current.apply_update(bytes(world.public.description_binary))
@@ -433,25 +376,6 @@ def test_editor_save_that_knows_everything_is_plane_unchanged(world, api_client)
     assert response.status_code == 200
     assert bytes(Page.objects.get(pk=world.public.pk).description_binary) == current.get_update()
     publish.assert_not_called()
-
-
-def test_editor_load_waits_for_a_running_api_edit(world, api_client):
-    api_client.force_authenticate(user=world.owner.user)
-    held = threading.Event()
-
-    def hold():
-        with lease.edit_lease(world.public.id):
-            held.set()
-            time.sleep(0.6)
-
-    thread = threading.Thread(target=hold)
-    thread.start()
-    held.wait(2)
-    started = time.monotonic()
-    response = api_client.get(_description_url(world))
-    waited = time.monotonic() - started
-    thread.join()
-    assert response.status_code == 200 and waited >= 0.4
 
 
 def test_restore_uses_the_version_document_itself(world, fake_live):
@@ -608,7 +532,13 @@ def test_duplicate_is_halo_s_and_marks_the_copy_until_its_copy_task_ran(world, a
     response = api_client.post(_app_page_url(world, "duplicate/"))
     assert response.status_code == 201, response.content
     copy = Page.objects.get(pk=response.json()["id"])
-    assert (copy.name, copy.description_html, copy.description_binary) == ("Plan (Copy)", ORIGINAL, None)
+    assert (copy.name, copy.description_html) == ("Plan (Copy)", ORIGINAL)
+    # The copy takes the source's document, with its own name as title; nothing is converted.
+    assert ydoc.body_signature(bytes(copy.description_binary)) == ydoc.body_signature(
+        bytes(world.public.description_binary))
+    copied = Doc()
+    copied.apply_update(bytes(copy.description_binary))
+    assert str(copied.get(ydoc.TITLE, type=XmlFragment)).endswith(">Plan (Copy)</heading>")
     assert ProjectPage.objects.filter(page=copy, project=world.project).exists()
     assert PageBeingCopied.objects.filter(page_id=copy.id).exists()
     queued = [call.kwargs for call in no_celery.call_args_list]
@@ -723,16 +653,6 @@ def test_duplicate_of_a_page_whose_html_lags_takes_its_document(world, api_clien
     assert world.owner.client.get(f"{world.base}{copy.id}/").json()["text_complete"] is False
 
 
-def test_duplicate_of_an_up_to_date_page_is_rebuilt_from_its_html_as_in_plane(world, api_client):
-    from plane.halo.models import PageTextBehind
-
-    api_client.force_authenticate(user=world.owner.user)
-    response = api_client.post(_app_page_url(world, "duplicate/"))
-    copy = Page.objects.get(pk=response.json()["id"])
-    assert copy.description_binary is None
-    assert not PageTextBehind.objects.filter(page_id=copy.id).exists()
-
-
 def test_duplicate_keeps_plane_s_private_page_rule(world, api_client):
     from plane.halo.models import PageBeingCopied
 
@@ -757,29 +677,6 @@ def test_api_edit_of_a_page_being_copied_is_refused(world, fake_live):
     assert (response.status_code, response.json()["code"]) == (409, "page_not_ready")
     assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
     assert not PageVersion.objects.filter(page=world.public).exists()
-
-
-def test_editor_load_of_a_page_being_copied_waits_then_loads(world, api_client):
-    from django.utils import timezone
-
-    from plane.halo.models import PageBeingCopied
-
-    api_client.force_authenticate(user=world.owner.user)
-    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
-    with patch("plane.halo.lease.WAIT_SECONDS", 0.3):
-        started = time.monotonic()
-        response = api_client.get(_description_url(world))
-        waited = time.monotonic() - started
-    assert response.status_code == 200 and waited >= 0.25
-
-
-def test_editor_load_waits_until_the_copy_task_ran(world, api_client):
-    api_client.force_authenticate(user=world.owner.user)
-    with patch("plane.halo.views.being_copied", side_effect=[True, True, False]) as copying, \
-            patch("plane.halo.views.time.sleep") as sleep:
-        response = api_client.get(_description_url(world))
-    assert response.status_code == 200
-    assert copying.call_count == 3 and sleep.call_count == 2
 
 
 def test_an_expired_copy_mark_is_ignored(world, fake_live, api_client):
@@ -855,7 +752,6 @@ def test_duplicate_without_a_broker_leaves_the_copy_usable(world, api_client):
     assert not PageBeingCopied.objects.filter(page_id=response.json()["id"]).exists()
 
 
-
 @pytest.mark.parametrize("value", [123, ["<p>x</p>"], {"html": "<p>x</p>"}])
 def test_create_refuses_html_that_is_not_text(world, value):
     pages = Page.objects.count()
@@ -871,7 +767,6 @@ def test_a_save_of_empty_html_alone_marks_the_text_as_behind(world, api_client):
     api_client.force_authenticate(user=world.owner.user)
     assert api_client.patch(_description_url(world), {"description_html": ""}, format="json").status_code == 200
     assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
-
 
 
 def _copy_with_document(world):
@@ -908,16 +803,6 @@ def test_copy_task_leaves_a_copied_document_someone_changed_meanwhile(world):
     assert bytes(after.description_binary) == edited and after.description_html == IMAGE_HTML
 
 
-
-def test_editor_load_works_while_redis_is_down(world, api_client):
-    """Plane reads the stored page from the database; a Redis outage must not stop that (nor live's fallback)."""
-    import redis
-
-    api_client.force_authenticate(user=world.owner.user)
-    with patch("plane.halo.lease.wait_until_free", side_effect=redis.ConnectionError("redis is down")):
-        assert api_client.get(_description_url(world)).status_code == 200
-
-
 def test_web_app_properties_patch_is_saved_although_the_broker_is_down(world, api_client):
     """As in Plane, the save stands; the page task is queued after commit and its failure only logged."""
     from plane.halo.models import PageTextBehind
@@ -945,36 +830,236 @@ def test_web_app_properties_patch_keeps_plane_s_answers(world, api_client):
 
 
 
-def test_editor_load_goes_on_when_redis_stops_answering(world, api_client):
+# ---- Plane's page load is stock (step-back, 2026-10-24) ----
+
+def test_editor_load_is_plane_s_own_handler(world):
+    from django.urls import resolve
+
+    from plane.app.views.page.base import PagesDescriptionViewSet
+    from plane.halo.views import HaloPagesDescriptionViewSet
+
+    assert resolve(_description_url(world)).func.cls is HaloPagesDescriptionViewSet
+    assert HaloPagesDescriptionViewSet.retrieve is PagesDescriptionViewSet.retrieve
+    defined = {name for name, value in vars(HaloPagesDescriptionViewSet).items() if callable(value)}
+    assert defined == {"partial_update", "_visible_page"}
+    for attribute in ("authentication_classes", "permission_classes", "throttle_classes", "dispatch", "initial"):
+        assert getattr(HaloPagesDescriptionViewSet, attribute) == getattr(PagesDescriptionViewSet, attribute)
+
+
+def test_editor_load_needs_neither_redis_nor_live(world, fake_live, api_client):
+    """With Halo's Redis down and live's converter down, loads answer as in stock Plane: the stored document, or
+    nothing for a page without one (live converts that page itself)."""
     import redis
 
-    from plane.halo import lease
-    from plane.halo.tests.conftest import silent_redis
-
+    fresh = world.make_page(world.owner, "Fresh", "<p>x</p>", binary=False)
+    fake_live.down = True
     api_client.force_authenticate(user=world.owner.user)
-    with silent_redis() as port, \
-            patch("plane.halo.lease.redis_client", return_value=lease.bounded(redis.Redis(host="127.0.0.1", port=port))):
-        started = time.monotonic()
-        response = api_client.get(_description_url(world))
-        took = time.monotonic() - started
-    assert response.status_code == 200 and took < 5
+    with patch("plane.halo.lease.redis_client", side_effect=redis.ConnectionError("redis is down")):
+        stored = api_client.get(_description_url(world))
+        empty = api_client.get(
+            f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{fresh.id}/description/")
+    assert stored.status_code == 200
+    assert b"".join(stored.streaming_content) == bytes(world.public.description_binary)
+    assert empty.status_code == 200 and b"".join(empty.streaming_content) == b""
+    assert fake_live.calls == [] and Page.objects.get(pk=fresh.pk).description_binary is None
 
 
-def test_editor_load_keeps_within_its_budget_and_leaves_the_rest_to_live(world, fake_live, api_client):
-    """Halo's waits and its first-document conversion share one budget inside live's 20 s request timeout; when
-    the waits used it up, the page goes to live without a document, which live converts itself (stock Plane)."""
+def test_editor_load_waits_for_neither_an_api_edit_nor_a_copy_task(world, api_client):
     from django.utils import timezone
 
     from plane.halo.models import PageBeingCopied
 
-    page = world.make_page(world.owner, "Fresh copy", "<p>x</p>", binary=False)
-    PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
+    PageBeingCopied.objects.create(page_id=world.public.id, since=timezone.now())
     api_client.force_authenticate(user=world.owner.user)
-    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
-    with patch("plane.halo.views.LOAD_WAIT_SECONDS", 0.3), patch("plane.halo.views.LOAD_BUDGET_SECONDS", 1.0):
+    with lease.edit_lease(world.public.id):
         started = time.monotonic()
-        response = api_client.get(url)
+        response = api_client.get(_description_url(world))
         took = time.monotonic() - started
-    assert response.status_code == 200 and took < 2
-    assert fake_live.calls == []  # under MIN_CONVERT_SECONDS left: no conversion started
-    assert Page.objects.get(pk=page.pk).description_binary is None
+    assert response.status_code == 200 and took < 0.5
+
+
+# ---- first documents only at API create ----
+
+def test_create_stores_a_first_document_with_the_title(world, fake_live):
+    response = world.member.client.post(
+        world.base, {"name": "Notes", "description_html": "<p>Hi</p><script>alert(1)</script>"}, format="json"
+    )
+    assert response.status_code == 201, response.content
+    page = Page.objects.get(pk=response.json()["id"])
+    assert "<script" not in page.description_html
+    assert page.owned_by_id == world.member.user.id
+    assert response.json()["url"].endswith(f"/pages/{page.id}")
+    assert response.json()["text_editable"] is True
+    loaded = Doc()
+    loaded.apply_update(bytes(page.description_binary))
+    assert str(loaded.get(ydoc.TITLE, type=XmlFragment)).endswith(">Notes</heading>")
+    assert page.description_json["content"][0]["content"][0]["text"] == "Hi"
+    assert ids(world.member.client.get(world.base)) == {str(world.public.id), str(page.id)}
+
+
+@pytest.mark.parametrize("failure,reason", [("down", "live_unavailable"), ("too_large", "page_too_large_for_editor")])
+def test_create_without_a_document_says_so_and_keeps_the_text(world, fake_live, failure, reason):
+    setattr(fake_live, failure, True)
+    response = world.owner.client.post(world.base, {"name": "Notes", "description_html": "<p>Kept</p>"}, format="json")
+    assert response.status_code == 201, response.content
+    answer = response.json()
+    assert (answer["text_editable"], answer["text_editable_reason"]) == (False, reason)
+    assert answer["text_editable_hint"]
+    page = Page.objects.get(pk=answer["id"])
+    assert (page.description_html, page.description_binary) == ("<p>Kept</p>", None)
+    setattr(fake_live, failure, False)
+    edit = world.owner.client.patch(f"{world.base}{page.id}/", {"description_html": "<p>New</p>",
+                                                                "expected_updated_at": answer["updated_at"]},
+                                    format="json")
+    assert (edit.status_code, edit.json()["code"]) == (409, "page_not_ready")
+
+
+def test_retrieve_says_whether_the_text_can_be_edited(world):
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["text_editable"] is True
+    fresh = world.make_page(world.owner, "Fresh", "<p>x</p>", binary=False)
+    answer = world.owner.client.get(f"{world.base}{fresh.id}/").json()
+    assert (answer["text_editable"], answer["text_editable_reason"]) == (False, "not_opened_yet")
+    assert "Open the page once in Halo" in answer["text_editable_hint"]
+
+
+def test_api_edit_of_a_page_never_opened_is_refused(world, fake_live):
+    """A page made in the web app and not opened since has no editor document; live builds it on first open."""
+    fresh = world.make_page(world.owner, "Fresh", "<p>Made in the web app</p>", binary=False)
+    url = f"{world.base}{fresh.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(url, {"append_html": "<p>more</p>", "expected_updated_at": stamp},
+                                        format="json")
+    assert (response.status_code, response.json()["code"]) == (409, "page_not_ready")
+    assert "Open it once in Halo" in response.json()["error"]
+    assert fake_live.calls == []
+    assert Page.objects.get(pk=fresh.pk).description_html == "<p>Made in the web app</p>"
+
+
+# ---- saves merge only with shared history ----
+
+def _save(api_client, world, binary, html=ORIGINAL):
+    return api_client.patch(_description_url(world), {"description_binary": base64.b64encode(binary).decode(),
+                                                      "description_html": html}, format="json")
+
+
+def test_two_separately_built_first_documents_are_not_merged(world, api_client):
+    """Two first documents of one page (live's own conversion and the browser's offline fallback): the later
+    save replaces the earlier one, as in Plane, instead of a union that would hold the text twice."""
+    separate = doc_for(["Alpha", "Beta", "Gamma"])  # converted on its own, like world.public's document
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.live.publish_update") as publish:
+        assert _save(api_client, world, separate).status_code == 200
+    stored = bytes(Page.objects.get(pk=world.public.pk).description_binary)
+    assert stored == separate
+    assert ydoc.body_signature(stored) == ydoc.body_signature(doc_for(["Alpha", "Beta", "Gamma"]))
+    publish.assert_not_called()
+
+
+def test_a_separately_built_document_saved_after_an_api_edit_replaces_it_as_plane_would(world, fake_live,
+                                                                                         api_client):
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    edited = world.owner.client.patch(url, {"description_html": "<p>Alpha</p><p>Beta by AURA</p><p>Gamma</p>",
+                                            "expected_updated_at": stamp}, format="json").json()
+    separate = doc_for(["Alpha", "Beta", "Gamma"])
+    api_client.force_authenticate(user=world.owner.user)
+    assert _save(api_client, world, separate).status_code == 200
+    assert bytes(Page.objects.get(pk=world.public.pk).description_binary) == separate
+    # The API edit stays restorable from its versions.
+    after = PageVersion.objects.get(pk=edited["after_version_id"])
+    assert "Beta by AURA" in after.description_html
+
+
+# ---- duplicates and the copy race ----
+
+def test_duplicate_makes_no_live_call(world, api_client):
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.live.convert_html", side_effect=AssertionError("no conversion in a duplicate")):
+        response = api_client.post(_app_page_url(world, "duplicate/"))
+    assert response.status_code == 201, response.content
+
+
+def test_duplicate_of_a_page_without_a_document_has_none(world, api_client):
+    fresh = world.make_page(world.owner, "Fresh", "<p>x</p>", binary=False)
+    api_client.force_authenticate(user=world.owner.user)
+    response = api_client.post(
+        f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{fresh.id}/duplicate/")
+    assert response.status_code == 201
+    assert Page.objects.get(pk=response.json()["id"]).description_binary is None
+
+
+IMAGE_JSON = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Alpha"}]},
+                                         {"type": "imageComponent", "attrs": {"src": "old-asset"}}]}
+
+
+def _copy_with_json(world):
+    copy = _copy_with_document(world)
+    Page.objects.filter(pk=copy.pk).update(description_json=IMAGE_JSON)
+    return Page.objects.get(pk=copy.pk)
+
+
+def test_copy_task_repoints_html_json_and_document_and_tells_live(world):
+    """The copy only opened: the task writes, and an editor that has the copy open gets the change."""
+    copy = _copy_with_json(world)
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED), \
+            patch("plane.halo.live.publish_update") as publish:
+        _finish(world, copy)
+    after = Page.objects.get(pk=copy.pk)
+    assert 'src="new-asset"' in after.description_html
+    assert after.description_json["content"][1]["attrs"]["src"] == "new-asset"
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
+    publish.assert_called_once_with(copy.id, bytes(after.description_binary))
+
+
+def test_copy_saved_before_the_task_reads_it_keeps_the_typing_and_gets_the_images(world, api_client):
+    copy = _copy_with_json(world)
+    typed = Doc()
+    typed.apply_update(bytes(copy.description_binary))
+    text = typed.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{copy.id}/description/"
+    html = '<p>Alpha typed</p><image-component src="old-asset"></image-component>'
+    assert api_client.patch(url, {"description_binary": base64.b64encode(typed.get_update()).decode(),
+                                  "description_html": html}, format="json").status_code == 200
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED), patch("plane.halo.live.publish_update"):
+        _finish(world, copy)
+    after = Page.objects.get(pk=copy.pk)
+    assert "Alpha typed" in after.description_html and 'src="new-asset"' in after.description_html
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
+    assert ydoc.body_signature(ydoc.with_image_sources(bytes(after.description_binary), {"new-asset": "old-asset"})) \
+        == ydoc.body_signature(typed.get_update())
+
+
+def test_copy_without_a_document_is_replaced_by_live_s_own_first_save_as_in_plane(world, api_client):
+    """Live converts such a copy from the HTML it read; if that was before the task wrote, live's first save
+    brings the original's image references back, as stock Plane can end too."""
+    copy = _copy_in_progress(world)  # no document
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED):
+        _finish(world, copy)
+    assert 'src="new-asset"' in Page.objects.get(pk=copy.pk).description_html
+    lives_own = doc_for(["Alpha", ("image", "old-asset")])
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{copy.id}/description/"
+    assert api_client.patch(url, {"description_binary": base64.b64encode(lives_own).decode(),
+                                  "description_html": IMAGE_HTML}, format="json").status_code == 200
+    after = Page.objects.get(pk=copy.pk)
+    assert after.description_html == IMAGE_HTML and bytes(after.description_binary) == lives_own
+
+
+def test_an_api_append_after_the_copy_task_keeps_the_copied_images(world, fake_live):
+    copy = _copy_with_json(world)
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED), patch("plane.halo.live.publish_update"):
+        _finish(world, copy)
+    url = f"{world.base}{copy.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(url, {"append_html": "<p>Added</p>", "expected_updated_at": stamp},
+                                        format="json")
+    assert response.status_code == 200, response.content
+    after = Page.objects.get(pk=copy.pk)
+    assert 'src="new-asset"' in after.description_html and "old-asset" not in after.description_html
+    assert after.description_json["content"][1]["attrs"]["src"] == "new-asset"
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["new-asset"]
+    for version_id in (response.json()["before_version_id"], response.json()["after_version_id"]):
+        version = PageVersion.objects.get(pk=version_id)
+        assert "new-asset" in version.description_html and "old-asset" not in version.description_html

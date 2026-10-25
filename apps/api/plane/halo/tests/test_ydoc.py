@@ -289,3 +289,14 @@ def test_an_empty_title_gets_the_page_name_and_a_title_stays():
     assert ydoc.body_signature(titled) == ydoc.body_signature(body_only)
     assert ydoc.with_title(titled, "Other") == titled
     assert text_of(ydoc.with_title(body_only, ""), ydoc.TITLE) == '<heading level="1"></heading>'
+
+
+
+def test_documents_without_shared_history_are_not_merged():
+    """Two separately converted first documents of one page share no client; a union would hold the text twice."""
+    first, second = page(p("Alpha"), p("Beta")), page(p("Alpha"), p("Beta"))
+    assert ydoc.missing_from(second, first) is None
+    # An editor's copy that missed a lineage edit of the stored document does get merged.
+    stored = ydoc.edit_document(first, new_body=page(p("Alpha"), p("Beta, edited"))).state
+    merged = ydoc.missing_from(first, stored)
+    assert merged is not None and text_of(merged[0]) == text_of(stored)

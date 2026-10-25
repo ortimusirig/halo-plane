@@ -19,8 +19,8 @@ class PageTextBehind(models.Model):
 
 
 class PageBeingCopied(models.Model):
-    """A page just made by Plane's duplicate, whose copy task (assets, then a save of the whole page) has not
-    finished. API edits are refused and editors' loads wait until the task removes the row."""
+    """A page just made by Plane's duplicate whose copy task (tasks.finish_page_copy: its images copied and
+    pointed at) has not run yet. API edits of it are refused until the task removes the row (or it expires)."""
 
     page_id = models.UUIDField(primary_key=True)
     since = models.DateTimeField()

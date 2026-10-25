@@ -303,11 +303,38 @@ def removed_parts(before: bytes, after: bytes) -> list[str]:
     return [f"{part[0]} {' '.join(part[1:])}" + (f" (x{count})" if count > 1 else "") for part, count in lost.items()]
 
 
+def _var_uint(data: bytes, index: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = data[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, index
+        shift += 7
+
+
+def _clients(state: bytes) -> set[int]:
+    """The client ids in an encoded Yjs state vector (count, then client and clock pairs, as varUints)."""
+    count, index = _var_uint(state, 0)
+    clients = set()
+    for _ in range(count):
+        client, index = _var_uint(state, index)
+        _, index = _var_uint(state, index)
+        clients.add(client)
+    return clients
+
+
 def missing_from(incoming: bytes, stored: bytes) -> tuple[bytes, bytes] | None:
-    """For a save from an editor: None when incoming already holds everything in stored; otherwise the union
-    of both (nothing is lost) and the part of stored that incoming lacks (to send to that editor)."""
+    """For a save from an editor: None when incoming already holds everything in stored, or when the two share
+    no history (no client in common: separately converted first documents of one page, which a union would
+    duplicate; the save then replaces the stored document, as Plane's does); otherwise the union of both
+    (nothing is lost) and the part of stored that incoming lacks (to send to that editor). An editor that
+    missed an API edit always shares history with the stored document, since API edits are lineage edits."""
     doc = _load(incoming)
     state, plain = doc.get_state(), doc.get_update()
+    if not _clients(state) & _clients(_load(bytes(stored)).get_state()):
+        return None
     doc.apply_update(bytes(stored))
     union = doc.get_update()
     if union == plain:

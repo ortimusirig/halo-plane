@@ -79,21 +79,25 @@ def _convert(html: str):
         raise EditRefused(*TOO_LARGE)
 
 
-def ensure_document(page_pk, timeout: float = live.CONVERT_SECONDS) -> None:
-    """Give a page its first document, built from its HTML with live's converter, unless it has one (under the
-    page's row lock). updated_at stays: building the document is not a change. Raises live.LiveTooLarge or
-    live.LiveUnavailable when live cannot convert it."""
-    with transaction.atomic():
-        page = Page.objects.select_for_update().only("pk", "name", "description_html", "description_binary").get(
-            pk=page_pk
-        )
-        if page.description_binary:
-            return
-        binary, json_data = live.convert_html(page.description_html or "<p></p>", timeout=timeout)
-        # Live's converter gives the body only; Plane's own first document also holds the page's name as its
-        # title (getBinaryDataFromDocumentEditorHTMLString), which the browser's offline fallback relies on.
-        binary = ydoc.with_title(binary, page.name or "")
-        Page.objects.filter(pk=page_pk).update(description_binary=binary, description_json=json_data)
+def first_document(html: str, name: str, timeout: float = live.CONVERT_SECONDS) -> tuple[bytes, dict]:
+    """The first document of a page nobody can be loading yet (one the API is creating): live's conversion of
+    its HTML, with the page's name as title, like Plane's own first document (getBinaryDataFromDocumentEditorHTML
+    String). Raises live.LiveTooLarge or live.LiveUnavailable. Halo never builds a first document for an
+    existing page: live does that when the page is first opened, as in Plane."""
+    binary, json_data = live.convert_html(html or "<p></p>", timeout=timeout)
+    return ydoc.with_title(binary, name or ""), json_data
+
+
+NOT_OPENED = (
+    409,
+    "page_not_ready",
+    "This page has not been opened in Halo since it was made, so it has no editor document yet. Open it once in "
+    "Halo; then its text can be edited here.",
+)
+
+
+def _has_document(page_pk) -> bool:
+    return bool(Page.objects.filter(pk=page_pk).values_list("description_binary", flat=True).first())
 
 
 def _publish(page_id, update: bytes):
@@ -144,7 +148,7 @@ COPY_STALE_AFTER = timedelta(minutes=2)
 
 
 def being_copied(page_id) -> bool:
-    """Whether Plane's copy task for a duplicated page is still to save the whole page (models.PageBeingCopied)."""
+    """Whether a duplicated page's copy task has still to run (models.PageBeingCopied)."""
     return PageBeingCopied.objects.filter(page_id=page_id, since__gt=timezone.now() - COPY_STALE_AFTER).exists()
 
 
@@ -177,6 +181,8 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         raise EditRefused(*TEXT_BEHIND)
     if being_copied(page.id):
         raise EditRefused(*BEING_COPIED)
+    if not _has_document(page.id):
+        raise EditRefused(*NOT_OPENED)
     if live.is_open(page.id):
         raise EditRefused(409, "page_open", "Someone has this page open in Halo. Ask them to close it, then try again.")
     clean = new_body = new_json = None
@@ -195,11 +201,6 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         clean = sanitize(html) or "<p></p>"
         new_body, new_json = _convert(clean)
 
-    try:
-        ensure_document(page.pk)
-    except live.LiveTooLarge:
-        raise EditRefused(*TOO_LARGE)
-
     with transaction.atomic():
         page = Page.objects.select_for_update().get(pk=page.pk)
         _check(page, expected_updated_at)
@@ -207,8 +208,8 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
             raise EditRefused(*TEXT_BEHIND)
         if being_copied(page.id):
             raise EditRefused(*BEING_COPIED)
-        if not page.description_binary:  # ensure_document gave it one; never edit a page without a document
-            raise EditRefused(409, "page_not_ready", "Halo could not prepare this page for editing; try again.")
+        if not page.description_binary:  # never edit a page without its document (live builds it on first open)
+            raise EditRefused(*NOT_OPENED)
         old = {
             "description_html": page.description_html,
             "description_binary": page.description_binary,

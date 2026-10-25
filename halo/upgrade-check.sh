@@ -189,6 +189,26 @@ mirrored() {  # <class> <expected fingerprint> <route suffix> <Halo class> [meth
 mirrored PagesDescriptionViewSet "$UPSTREAM_DESCRIPTION_FINGERPRINT" description HaloPagesDescriptionViewSet
 mirrored PageDuplicateEndpoint "$UPSTREAM_DUPLICATE_FINGERPRINT" duplicate HaloPageDuplicateEndpoint
 mirrored PageViewSet "$UPSTREAM_PAGE_FINGERPRINT" "" HaloAppPageViewSet partial_update
+# The page load is Plane's own PagesDescriptionViewSet.retrieve (fingerprinted above): Halo's subclass may define
+# its save (partial_update) and the lookup it uses, and nothing else that could run on a load.
+load_view=$("$py" -c '
+import ast, sys
+for node in ast.parse(open(sys.argv[1], encoding="utf-8").read()).body:
+    if isinstance(node, ast.ClassDef) and node.name == "HaloPagesDescriptionViewSet":
+        names = sorted(
+            item.name if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else "attribute:" + ",".join(getattr(target, "id", "?") for target in getattr(item, "targets", [item]))
+            for item in node.body
+            if not (isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant))
+        )
+        print(" ".join(names))
+' apps/api/plane/halo/views.py | tr -d '\r')
+if [ "$load_view" = "_visible_page partial_update" ]; then
+  echo "OK   the page load is Plane's own handler (Halo's description view defines only its save)"
+else
+  echo "FAIL Halo's description view defines more than its save ($load_view): the page load must stay Plane's"
+  failures=$((failures + 1))
+fi
 copy_found=$(for name in copy_s3_objects_of_description_and_assets copy_assets extract_asset_ids replace_asset_ids; do
   fingerprint bgtasks/copy_s3_object.py "$name"
 done | tr '\n' ' ' | sed 's/ $//')

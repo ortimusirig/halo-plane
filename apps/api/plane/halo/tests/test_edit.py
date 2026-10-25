@@ -94,39 +94,6 @@ def test_live_down_changes_nothing(world, fake_live):
 
 
 @pytest.mark.django_db
-def test_page_never_opened_gets_its_document_before_the_edit(world, fake_live):
-    """Never an edit without a document: live then cannot build a second one from the old HTML."""
-    page = world.make_page(world.owner, "Fresh", "<p>One</p>", binary=False)
-    result = _edit(world, page=page, html="<p>Two</p>")
-    page.refresh_from_db()
-    assert result["changed"]
-    assert fake_live.calls == ["<p>Two</p>", "<p>One</p>"]  # the new text, then the page's first document
-    assert ydoc.body_signature(page.description_binary) == ydoc.body_signature(doc_for(["Two"]))
-    assert page.description_html == "<p>Two</p>"
-    assert PageVersion.objects.get(pk=result["before_version_id"]).description_html == "<p>One</p>"
-
-
-@pytest.mark.django_db
-def test_append_to_a_never_opened_page_too_large_for_the_converter_is_refused(world, fake_live):
-    from plane.halo.live import LiveTooLarge
-
-    page = world.make_page(world.owner, "Big", "<p>big</p>", binary=False)
-
-    def convert(html):
-        # The small appended part converts; the page's own HTML (for its first document) is too large.
-        if html == "<p>x</p>":
-            return doc_for(["x"]), {}
-        raise LiveTooLarge("over 100 kB")
-
-    with patch("plane.halo.live.convert_html", side_effect=convert):
-        with pytest.raises(edit.EditRefused) as refused:
-            _edit(world, page=page, html="<p>x</p>", append=True)
-    assert (refused.value.status, refused.value.code) == (413, "page_too_large_for_editor")
-    page.refresh_from_db()
-    assert page.description_binary is None and page.description_html == "<p>big</p>"
-
-
-@pytest.mark.django_db
 def test_same_text_is_no_change_and_no_versions(world, fake_live):
     result = _edit(world, html=ORIGINAL)
     assert not result["changed"]
@@ -249,7 +216,6 @@ def test_appends_cannot_grow_a_page_past_plane_s_limit(world, fake_live):
     assert Page.objects.get(pk=world.public.pk).description_html == ORIGINAL
 
 
-
 def _texts(json_data):
     return [block["content"][0]["text"] for block in json_data.get("content", [])]
 
@@ -275,7 +241,6 @@ def test_an_append_to_a_page_with_unknown_json_does_not_claim_the_added_blocks_a
     assert page.description_html == ORIGINAL + "<p>Added</p>"
 
 
-
 @pytest.mark.django_db
 def test_a_failed_lease_release_does_not_hide_a_saved_edit(world, fake_live):
     """Redis failing after the commit: the edit is saved and answered; the lease key expires by itself."""
@@ -290,3 +255,14 @@ def test_a_failed_lease_release_does_not_hide_a_saved_edit(world, fake_live):
         result = _edit(world, html="<p>Alpha</p><p>Beta, saved</p><p>Gamma</p>")
     assert result["changed"] and result["after_version_id"]
     assert "Beta, saved" in Page.objects.get(pk=world.public.pk).description_html
+
+
+
+@pytest.mark.django_db
+def test_a_page_never_opened_is_refused_and_nothing_is_converted(world, fake_live):
+    page = world.make_page(world.owner, "Fresh", "<p>Made in the web app</p>", binary=False)
+    with pytest.raises(edit.EditRefused) as refused:
+        _edit(world, page=page, html="<p>Other</p>")
+    assert (refused.value.status, refused.value.code) == (409, "page_not_ready")
+    assert fake_live.calls == []
+    assert Page.objects.get(pk=page.pk).description_binary is None

@@ -64,6 +64,10 @@ expect "gate fails a branch relabelled to $new but not rebased" 1 "is not built 
 outside=$(commit_with apps/api/plane/app/views/page/base.py '$a # changed outside Halo')
 expect "gate fails a patch outside Halo's files" 1 "apps/api/plane/app/views/page/base.py" \
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --candidate "$outside" --check-only
+on_load=$(commit_with apps/api/plane/halo/views.py \
+  '/^class HaloPagesDescriptionViewSet/a\    def retrieve(self, request, *args, **kwargs):\n        return None')
+expect "gate fails Halo code on Plane's page load" 1 "the page load must stay Plane's" \
+  "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --candidate "$on_load" --check-only
 expect "this branch passes the gate's checks" 0 "CHECK ONLY: 0 failed" \
   "${nodocker[@]}" bash halo/upgrade-check.sh "$new" --check-only
 # Plane's code that Halo mirrors or replaces is unchanged in the new tag, so no fingerprint item may be open.

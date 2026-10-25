@@ -13,8 +13,23 @@ from plane.bgtasks.page_version_task import track_page_version
 from plane.db.models import Page
 from plane.utils.exception_logger import log_exception
 
-from . import ydoc
+from . import live, ydoc
 from .models import PageBeingCopied, PageTextBehind
+
+IMAGE_NODES = ("imageComponent", "image")
+
+
+def _json_with_image_sources(node, sources: dict):
+    """ProseMirror JSON with each image node's attrs.src found in sources replaced (a copy of the input)."""
+    if isinstance(node, list):
+        return [_json_with_image_sources(item, sources) for item in node]
+    if not isinstance(node, dict):
+        return node
+    node = {key: _json_with_image_sources(value, sources) for key, value in node.items()}
+    attrs = node.get("attrs")
+    if node.get("type") in IMAGE_NODES and isinstance(attrs, dict) and attrs.get("src") in sources:
+        node["attrs"] = {**attrs, "src": sources[attrs["src"]]}
+    return node
 
 
 @shared_task
@@ -33,36 +48,48 @@ def track_page_version_after_save(page_id, existing_instance, user_id):
 @shared_task
 def finish_page_copy(page_id, project_id, user_id):
     """Plane's copy task for a duplicated page (copy_s3_objects_of_description_and_assets), with Plane's own
-    helpers but none of its whole-page saves: the page's images are copied, and the copy's text is pointed at the
-    copies in one update of its HTML (and of its document, when the copy took the source's document), made only
-    if nobody changed them since they were read. So the task can never write back other fields (name, archive,
-    lock, access) or overwrite an edit, however late it runs. A copy without a document gets one from its HTML on
-    the first load, as every new page does (views.HaloPagesDescriptionViewSet). The "being copied" mark goes at
-    the end, also on errors."""
+    helpers but none of its whole-page saves: the page's images are copied, and the copy's HTML, JSON and (when
+    it has one) document are pointed at the copies in one update, made only if none of them changed since they
+    were read. So the task can never write back other fields (name, archive, lock, access) or overwrite an edit,
+    however late it runs. The document change is a lineage edit of the document it read; it is published to
+    live, so an editor that has the copy open receives it (a save that missed it is merged). The "being copied"
+    mark goes at the end, also on errors."""
     try:
         page = Page.objects.select_related("workspace").filter(pk=page_id).first()
         if page is None:
             return
-        html = page.description_html
+        html, json_data = page.description_html, page.description_json
         document = bytes(page.description_binary) if page.description_binary else None
         asset_ids = extract_asset_ids(html, "image-component")
-        if document:  # the copy of a page whose HTML lagged its document: the document has every image
+        if document:  # the copy took the source's document, which has every image (its HTML may lag)
             asset_ids = list(dict.fromkeys(asset_ids + ydoc.image_sources(document)))
         if not asset_ids:
             return
         copies = copy_assets(page, page_id, project_id, asset_ids, user_id)
         if not copies:
             return
-        changes = {"description_html": replace_asset_ids(html, "image-component", copies), "updated_at": timezone.now()}
+        sources = {copy["old_asset_id"]: copy["new_asset_id"] for copy in copies}
+        changes = {
+            "description_html": replace_asset_ids(html, "image-component", copies),
+            "description_json": _json_with_image_sources(json_data, sources),
+            "updated_at": timezone.now(),
+        }
         if document:
-            sources = {copy["old_asset_id"]: copy["new_asset_id"] for copy in copies}
             changes["description_binary"] = ydoc.with_image_sources(document, sources)
+        written = False
         with transaction.atomic():
             current = Page.objects.select_for_update().filter(pk=page_id).values(
-                "description_html", "description_binary").first()
+                "description_html", "description_json", "description_binary").first()
             stored = current and current["description_binary"]
-            if current and current["description_html"] == html and (bytes(stored) if stored else None) == document:
+            if (current and current["description_html"] == html and current["description_json"] == json_data
+                    and (bytes(stored) if stored else None) == document):
                 Page.objects.filter(pk=page_id).update(**changes)
+                written = True
+        if written and document:
+            try:  # editors that have the copy open; one that misses it is merged on its next save
+                live.publish_update(page_id, changes["description_binary"])
+            except Exception as error:
+                log_exception(error)
     except Exception as error:  # as in Plane's task: logged, and the copy keeps showing the original's images
         log_exception(error)
     finally:
