@@ -342,30 +342,44 @@ const webEdit = opened && await api("PATCH", `pages/${webPage.id}/`, {
 check("13c once opened, the API edits it", Boolean(webEdit) && webEdit.status === 200 && webEdit.data.changed,
   JSON.stringify(webEdit?.data ?? opened));
 
-// 14. The copy race: a copy opened and typed in at once, before its copy task may have run. The typing ends up
-// saved once, with no block twice.
+// 14. The copy race, in a set order: the worker is stopped, so the copy is opened and typed in (and saved by
+// live) before its copy task runs; then the worker runs the task while the editor is open. The task's change
+// reaches the open editor, and the copy ends with the typing once, no block twice, and its own image.
+execFileSync("docker", [...COMPOSE, "stop", "worker"], { encoding: "utf8" });
 const raceCopyResponse = await fetch(`${API}/api/workspaces/${seed.slug}/projects/${seed.project_id}/pages/${imaged.data.id}/duplicate/`, {
   method: "POST",
   headers: { Cookie: seed.cookie, "Content-Type": "application/json" },
 });
 const raceCopy = await raceCopyResponse.json();
+const marked = () =>
+  inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${raceCopy.id}").exists())`)
+    .split(/\r?\n/).pop() === "True";
 const docR = new Y.Doc();
 const editorR = await connect(docR, raceCopy.id);
 await waitFor(() => docR.getXmlFragment("default").length === 3);
 textAt(docR, 0).insert(textAt(docR, 0).length, " raced");
-await sleep(500);
+const typedSaved = await waitFor(async () => (await page(raceCopy.id)).description_html.includes("raced"), 15000);
+check("14a the copy is open, typed in and saved before its copy task runs", Boolean(typedSaved) && marked(),
+  `saved=${Boolean(typedSaved)} marked=${marked()}`);
+execFileSync("docker", [...COMPOSE, "start", "worker"], { encoding: "utf8" });
+const taskRan = await waitFor(async () => !marked(), 60000);
+const reachedEditor = await waitFor(() => {
+  const src = docR.getXmlFragment("default").get(1)?.getAttribute?.("src");
+  return src && src !== assetId ? src : null;
+}, 10000);
+check("14b the copy task ran and its change reached the open editor", Boolean(taskRan) && Boolean(reachedEditor),
+  `ran=${Boolean(taskRan)} src=${docR.getXmlFragment("default").get(1)?.getAttribute?.("src")}`);
 closeEditor(editorR);
 const raced = await waitFor(async () => {
-  const done = inApi(`from plane.halo.models import PageBeingCopied; print(PageBeingCopied.objects.filter(page_id="${raceCopy.id}").exists())`)
-    .split(/\r?\n/).pop() === "False";
   const html = (await page(raceCopy.id)).description_html;
-  return done && (await closed(raceCopy.id)) && html.includes("raced") ? html : null;
+  return (await closed(raceCopy.id)) && html.includes("raced") ? html : null;
 }, 30000);
 const racedBlocks = inApi(
   `from plane.db.models import Page; from plane.halo import ydoc; print(len(ydoc.body_signature(bytes(Page.objects.get(pk="${raceCopy.id}").description_binary))))`,
 ).split(/\r?\n/).pop();
-check("14 a copy typed in before its copy task keeps the typing once, no block twice",
-  Boolean(raced) && (raced.match(/raced/g) ?? []).length === 1 && racedBlocks === "3",
+check("14c the copy keeps the typing once, no block twice, and its own image",
+  Boolean(raced) && (raced.match(/raced/g) ?? []).length === 1 && racedBlocks === "3" &&
+    raced.includes(`src="${reachedEditor}"`) && !raced.includes(`src="${assetId}"`),
   `${raced} blocks=${racedBlocks}`);
 
 console.log(failures ? `${failures} FAILED` : "ALL PASSED");

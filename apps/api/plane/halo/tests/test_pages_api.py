@@ -272,7 +272,9 @@ def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_cli
             format="json",
         )
     assert response.status_code == 200, response.content
-    assert len(callbacks) == 1  # page_transaction only: a merged save makes no version (its HTML is older)
+    # A merged save queues nothing: its HTML is older, so no version and no mention index from it (that would
+    # drop the API edit's mentions from Plane's index); the editor's next, complete save does both.
+    assert len(callbacks) == 0
     saved = Doc()
     saved.apply_update(bytes(Page.objects.get(pk=world.public.pk).description_binary))
     assert str(saved.get(ydoc.BODY, type=XmlFragment)) == (
@@ -1063,3 +1065,29 @@ def test_an_api_append_after_the_copy_task_keeps_the_copied_images(world, fake_l
     for version_id in (response.json()["before_version_id"], response.json()["after_version_id"]):
         version = PageVersion.objects.get(pk=version_id)
         assert "new-asset" in version.description_html and "old-asset" not in version.description_html
+
+
+
+MIXED_HTML = ('<p>Alpha</p><image-component src="11111111-1111-4111-8111-111111111111"></image-component>'
+              '<img src="https://example.com/logo.png"><img src="22222222-2222-4222-8222-222222222222">')
+MIXED_COPIES = [{"old_asset_id": "11111111-1111-4111-8111-111111111111", "new_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                {"old_asset_id": "22222222-2222-4222-8222-222222222222", "new_asset_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}]
+
+
+def test_copy_task_copies_uploaded_images_and_leaves_web_images_alone(world):
+    """Only asset UUIDs are copied (a web image's URL would make Plane's asset query fail for the whole page),
+    and an uploaded image in an img tag is pointed at its copy too."""
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+
+    copy = world.make_page(world.owner, "Mixed (Copy)", MIXED_HTML, binary=False)
+    PageBeingCopied.objects.create(page_id=copy.id, since=timezone.now())
+    with patch("plane.halo.tasks.copy_assets", return_value=MIXED_COPIES) as copy_assets:
+        _finish(world, copy)
+    assert copy_assets.call_args.args[3] == ["11111111-1111-4111-8111-111111111111",
+                                             "22222222-2222-4222-8222-222222222222"]
+    html = Page.objects.get(pk=copy.pk).description_html
+    assert 'src="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"' in html and 'src="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"' in html
+    assert 'src="https://example.com/logo.png"' in html
+    assert "11111111-1111" not in html and "22222222-2222" not in html

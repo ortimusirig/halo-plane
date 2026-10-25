@@ -300,3 +300,21 @@ def test_documents_without_shared_history_are_not_merged():
     stored = ydoc.edit_document(first, new_body=page(p("Alpha"), p("Beta, edited"))).state
     merged = ydoc.missing_from(first, stored)
     assert merged is not None and text_of(merged[0]) == text_of(stored)
+
+
+
+def test_a_mention_s_id_is_content_and_a_block_s_id_is_not():
+    """UniqueID gives block nodes an id of the browser's own (ignored); a mention's id is its own (kept in step)."""
+    def mention(mention_id):
+        return ("paragraph", {"id": "block-1"}, [("Hi ", None)]), ("mention", {
+            "id": mention_id, "entity_name": "user_mention", "entity_identifier": "u1"}, [])
+
+    old = page(*mention("m1"))
+    same_but_block_id = page(("paragraph", {"id": "block-2"}, [("Hi ", None)]),
+                             ("mention", {"id": "m1", "entity_name": "user_mention", "entity_identifier": "u1"}, []))
+    assert not ydoc.edit_document(old, new_body=same_but_block_id).changed
+    edit = ydoc.edit_document(old, new_body=page(*mention("m2")))
+    assert edit.changed
+    doc = Doc()
+    doc.apply_update(edit.state)
+    assert dict(doc.get(ydoc.BODY, type=XmlFragment).children[1].attributes)["id"] == "m2"

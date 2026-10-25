@@ -23,6 +23,20 @@ from pycrdt import Doc, XmlElement, XmlFragment, XmlText
 BODY = "default"
 TITLE = "title"
 EDITOR_ID = "id"  # UniqueID's block id (packages/editor unique-id extension)
+# The node types UniqueID gives that id (BLOCK_NODE_TYPES, packages/editor/src/core/constants/extension.ts): only
+# there is it the browser's own bookkeeping, ignored when comparing; anywhere else (a mention) it is content.
+UNIQUE_ID_TYPES = frozenset({
+    "paragraph", "heading", "blockquote", "codeBlock", "horizontalRule", "bulletList", "orderedList", "listItem",
+    "taskList", "taskItem", "table", "image", "imageComponent", "calloutComponent", "issue-embed-component",
+})
+
+
+def _own_attributes(node) -> dict:
+    """A node's attributes without UniqueID's block id."""
+    attributes = dict(node.attributes)
+    if node.tag in UNIQUE_ID_TYPES:
+        attributes.pop(EDITOR_ID, None)
+    return attributes
 # Page parts an edit must not drop by accident: Yjs elements are named after the editor's node types
 # (packages/editor/src/core/constants/extension.ts), with the attributes that say which one each is.
 PROTECTED_PARTS = {
@@ -51,7 +65,7 @@ def _load(binary: bytes) -> Doc:
 def _signature(node):
     if isinstance(node, XmlText):
         return ("text", json.dumps(node.diff(), sort_keys=True, default=str))
-    attributes = {key: value for key, value in dict(node.attributes).items() if key != EDITOR_ID}
+    attributes = _own_attributes(node)
     return (
         node.tag,
         json.dumps(attributes, sort_keys=True, default=str),
@@ -153,9 +167,9 @@ def _patch_text(text: XmlText, new: XmlText) -> bool:
 def _patch_element(element: XmlElement, new: XmlElement) -> bool:
     changed = False
     old_attributes = dict(element.attributes)
-    new_attributes = {key: value for key, value in dict(new.attributes).items() if key != EDITOR_ID}
-    for key in old_attributes:
-        if key != EDITOR_ID and key not in new_attributes:
+    new_attributes = _own_attributes(new)
+    for key in _own_attributes(element):
+        if key not in new_attributes:
             del element.attributes[key]
             changed = True
     for key, value in new_attributes.items():

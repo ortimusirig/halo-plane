@@ -469,7 +469,9 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
                 PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
             elif document_saved:
                 PageTextBehind.objects.filter(page_id=page.pk).delete()
-            if data.get("description_html"):
+            if data.get("description_html") and not merged:
+                # A merged save's HTML lacks what the editor missed (an API edit's mentions or embeds), so it would
+                # drop them from Plane's index; the editor's next, complete save indexes the whole text.
                 new_html = data["description_html"]
                 transaction.on_commit(lambda: _queue(
                     page_transaction, new_description_html=new_html, old_description_html=old_description_html,

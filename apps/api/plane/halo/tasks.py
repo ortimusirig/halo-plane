@@ -4,6 +4,8 @@
 
 """Background tasks of Halo's page patch (found by Celery's autodiscovery in installed apps)."""
 
+import uuid
+
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
@@ -17,6 +19,20 @@ from . import live, ydoc
 from .models import PageBeingCopied, PageTextBehind
 
 IMAGE_NODES = ("imageComponent", "image")
+IMAGE_TAGS = ("image-component", "img")  # the same images in the HTML
+
+
+def _asset_ids(sources) -> list[str]:
+    """Uploaded images are named by their asset's UUID; any other source (an image from the web) stays as it is."""
+    ids = []
+    for source in sources:
+        try:
+            uuid.UUID(str(source))
+        except ValueError:
+            continue
+        if source not in ids:
+            ids.append(source)
+    return ids
 
 
 def _json_with_image_sources(node, sources: dict):
@@ -60,17 +76,21 @@ def finish_page_copy(page_id, project_id, user_id):
             return
         html, json_data = page.description_html, page.description_json
         document = bytes(page.description_binary) if page.description_binary else None
-        asset_ids = extract_asset_ids(html, "image-component")
+        sources = [source for tag in IMAGE_TAGS for source in extract_asset_ids(html, tag)]
         if document:  # the copy took the source's document, which has every image (its HTML may lag)
-            asset_ids = list(dict.fromkeys(asset_ids + ydoc.image_sources(document)))
+            sources += ydoc.image_sources(document)
+        asset_ids = _asset_ids(sources)
         if not asset_ids:
             return
         copies = copy_assets(page, page_id, project_id, asset_ids, user_id)
         if not copies:
             return
         sources = {copy["old_asset_id"]: copy["new_asset_id"] for copy in copies}
+        new_html = html
+        for tag in IMAGE_TAGS:
+            new_html = replace_asset_ids(new_html, tag, copies)
         changes = {
-            "description_html": replace_asset_ids(html, "image-component", copies),
+            "description_html": new_html,
             "description_json": _json_with_image_sources(json_data, sources),
             "updated_at": timezone.now(),
         }

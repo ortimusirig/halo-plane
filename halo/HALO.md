@@ -86,7 +86,8 @@ Halo. Only then switch the backend services to the image.
      browser's offline fallback's) replaces it, as Plane's save does. When the stored HTML and document
      disagree (a merged save, or a save of only one of them) the page is marked in Halo's own table
      (`halo_page_text_behind`, same transaction) until a save of both: Halo's API then reports
-     `text_complete: false` and its edits wait, and the merged save makes no page version.
+     `text_complete: false` and its edits wait, and the merged save makes no page version and leaves Plane's
+     mention index alone (its HTML lacks the API edit's parts; the editor's next, complete save updates both).
    - Lock, unlock and access run Plane's own code after locking the page's row, so none of them can write
      old text back over an API edit that committed in between. The properties PATCH is a copy of Plane's
      `PageViewSet.partial_update` (same checks, serializer and answers; fingerprinted by the upgrade gate) under
@@ -101,7 +102,8 @@ Halo. Only then switch the backend services to the image.
      copy without one, as in Plane), and a source whose HTML lags its document passes that mark on. Plane's
      copy task (it copies the images, then saves the whole page it read, twice) is replaced for pages by Halo's
      `finish_page_copy`, built from Plane's own helpers and fingerprinted by the upgrade gate: it copies the
-     images and points the copy's HTML, JSON and document at them in one update, made only if none of them
+     uploaded images (asset ids, in `image-component` and `img`; images from the web stay as they are) and
+     points the copy's HTML, JSON and document at them in one update, made only if none of them
      changed since it read them, and publishes the document change to live. So it never writes back a name,
      archive, lock or access change, nor overwrites an edit, however late it runs; a copy saved between its read
      and its write keeps the original's images, as stock Plane can end too. The end-to-end test checks that a
