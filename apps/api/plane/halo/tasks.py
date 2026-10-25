@@ -11,8 +11,9 @@ from django.db import transaction
 from django.utils import timezone
 
 from plane.bgtasks.copy_s3_object import copy_assets, extract_asset_ids, replace_asset_ids
+from plane.bgtasks.page_transaction_task import page_transaction
 from plane.bgtasks.page_version_task import track_page_version
-from plane.db.models import Page
+from plane.db.models import Page, PageLog
 from plane.utils.exception_logger import log_exception
 
 from . import live, ydoc
@@ -46,6 +47,31 @@ def _json_with_image_sources(node, sources: dict):
     if node.get("type") in IMAGE_NODES and isinstance(attrs, dict) and attrs.get("src") in sources:
         node["attrs"] = {**attrs, "src": sources[attrs["src"]]}
     return node
+
+
+def _indexed_html(page_id) -> str:
+    """The page's entries in Plane's mention index (PageLog), written as the HTML page_transaction reads."""
+    parts = []
+    for transaction_id, entity_name in PageLog.objects.filter(page_id=page_id).values_list("transaction",
+                                                                                         "entity_name"):
+        tag = "image-component" if entity_name == "image" else "mention-component"
+        parts.append(f'<{tag} id="{transaction_id}"></{tag}>')
+    return "".join(parts)
+
+
+@shared_task
+def reindex_page(page_id):
+    """Plane's mention index brought in line with the page's stored text, both read when the task runs: queued
+    after the indexing tasks of earlier saves, it runs after them in queue order (as Plane's own indexing relies
+    on), so whatever they added or kept and the text no longer has is removed, and anything missing is added.
+    Queued by the save that clears a page's mark (views.HaloPagesDescriptionViewSet), since merged saves are not
+    indexed."""
+    page = Page.objects.filter(pk=page_id).only("description_html").first()
+    if page is None:
+        return
+    # Called directly, Plane's task runs here.
+    page_transaction(new_description_html=page.description_html or "", old_description_html=_indexed_html(page_id),
+                     page_id=page_id)
 
 
 @shared_task
