@@ -84,6 +84,20 @@ def live_channel(page_id, holds_page=True):
         pubsub.close()
 
 
+@contextmanager
+def silent_redis():
+    """A Redis address that accepts connections and never answers, as a stalled server does."""
+    import socket
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    try:
+        yield server.getsockname()[1]
+    finally:
+        server.close()
+
+
 @pytest.fixture(autouse=True)
 def no_celery():
     with patch("celery.app.task.Task.delay") as delay:
@@ -103,7 +117,7 @@ def fake_live():
 
     state = SimpleNamespace(down=False, too_large=False, calls=[])
 
-    def convert(html):
+    def convert(html, timeout=None):
         state.calls.append(html)
         if state.down:
             raise LiveUnavailable("live is down")

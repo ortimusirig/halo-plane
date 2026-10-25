@@ -19,7 +19,7 @@ import redis
 import requests
 from django.conf import settings
 
-from plane.settings.redis import redis_instance
+from .lease import redis_client
 
 # HALO_LIVE_URL, else Plane's own setting (LIVE_BASE_URL plus LIVE_BASE_PATH), else live on Plane's compose network.
 LIVE_URL = os.environ.get("HALO_LIVE_URL") or getattr(settings, "LIVE_URL", None) or "http://live:3000/live/"
@@ -48,13 +48,16 @@ def convertible(html: str) -> str:
     return html if "<" in html and ">" in html else f"<p>{html}</p>"
 
 
-def convert_html(html: str) -> tuple[bytes, dict]:
+CONVERT_SECONDS = 10
+
+
+def convert_html(html: str, timeout: float = CONVERT_SECONDS) -> tuple[bytes, dict]:
     """Live's conversion of HTML into the page editor's Yjs document and ProseMirror JSON."""
     try:
         reply = requests.post(
             urljoin(LIVE_URL, "convert-document/"),
             json={"description_html": convertible(html), "variant": "document"},
-            timeout=10,
+            timeout=timeout,
         )
     except requests.RequestException as error:
         raise LiveUnavailable(str(error)) from error
@@ -78,7 +81,7 @@ def is_open(page_id) -> bool:
     opened since live started". A server that holds the page answers an awareness query; one that does not
     stays silent, so silence for PROBE_SECONDS means closed.
     """
-    client = redis_instance()
+    client = redis_client()
     pubsub = client.pubsub(ignore_subscribe_messages=True)
     try:
         if not any(count for _, count in client.pubsub_numsub(channel(page_id))):
@@ -132,4 +135,4 @@ def query_awareness_message(page_id) -> bytes:
 
 def publish_update(page_id, update: bytes) -> int:
     """Send a Yjs update to every open editor of the page; returns the number of live servers reached."""
-    return redis_instance().publish(channel(page_id), sync_update_message(page_id, update))
+    return redis_client().publish(channel(page_id), sync_update_message(page_id, update))

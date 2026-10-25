@@ -9,11 +9,39 @@ import time
 import uuid
 from contextlib import contextmanager
 
+import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
+
 from plane.settings.redis import redis_instance
 from plane.utils.exception_logger import log_exception
 
 LEASE_SECONDS = 60  # longer than any edit (two 10 s conversions at most); a crashed edit frees it after this
-WAIT_SECONDS = 15  # longest an editor's load waits for an edit (live gives up on the API after 20 s)
+WAIT_SECONDS = 15  # longest an editor's load waits for an edit (capped by the load's budget, views)
+SOCKET_SECONDS = 1.0  # Halo's Redis calls never wait longer than this for a reply
+
+_client = None
+
+
+def bounded(client: redis.Redis) -> redis.Redis:
+    """A client for the same Redis as client (Plane's settings, SSL included), whose connects and replies time
+    out after SOCKET_SECONDS: a Redis that stops answering must not hold up a page load."""
+    pool = client.connection_pool
+    kwargs = {
+        **pool.connection_kwargs,
+        "socket_timeout": SOCKET_SECONDS,
+        "socket_connect_timeout": SOCKET_SECONDS,
+        "retry": Retry(NoBackoff(), 0),  # no retries, whatever a newer redis-py's default (6.x retries thrice)
+    }
+    return redis.Redis(connection_pool=redis.ConnectionPool(connection_class=pool.connection_class, **kwargs))
+
+
+def redis_client() -> redis.Redis:
+    """Halo's Redis client (leases, open-page probes, live updates), bounded as above."""
+    global _client
+    if _client is None:
+        _client = bounded(redis_instance())
+    return _client
 
 
 class PageBusy(Exception):
@@ -26,7 +54,7 @@ def key(page_id) -> str:
 
 @contextmanager
 def edit_lease(page_id):
-    client, token = redis_instance(), uuid.uuid4().hex
+    client, token = redis_client(), uuid.uuid4().hex
     if not client.set(key(page_id), token, nx=True, ex=LEASE_SECONDS):
         raise PageBusy(str(page_id))
     try:
@@ -47,7 +75,7 @@ def edit_lease(page_id):
 
 def wait_until_free(page_id, seconds: float | None = None) -> bool:
     """True once no edit holds the page; False if one still does after seconds (default WAIT_SECONDS)."""
-    client, deadline = redis_instance(), time.monotonic() + (WAIT_SECONDS if seconds is None else seconds)
+    client, deadline = redis_client(), time.monotonic() + (WAIT_SECONDS if seconds is None else seconds)
     while client.exists(key(page_id)):
         if time.monotonic() >= deadline:
             return False

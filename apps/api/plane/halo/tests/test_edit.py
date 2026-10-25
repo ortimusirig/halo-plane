@@ -286,7 +286,7 @@ def test_a_failed_lease_release_does_not_hide_a_saved_edit(world, fake_live):
     client = MagicMock()
     client.set.return_value = True
     client.eval.side_effect = redis.ConnectionError("redis went away")
-    with patch("plane.halo.lease.redis_instance", return_value=client):
+    with patch("plane.halo.lease.redis_client", return_value=client):
         result = _edit(world, html="<p>Alpha</p><p>Beta, saved</p><p>Gamma</p>")
     assert result["changed"] and result["after_version_id"]
     assert "Beta, saved" in Page.objects.get(pk=world.public.pk).description_html

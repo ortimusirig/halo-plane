@@ -72,9 +72,11 @@ Halo. Only then switch the backend services to the image.
    beyond Plane's own checks; Halo only waits, locks and marks, for the sake of its API.
 
    - Loading a page (`HaloPagesDescriptionViewSet`) waits a moment while an API edit of it runs or a new copy's
-     copy task runs (at most 15 seconds each), then goes on as in Plane. A page without a document gets one
-     built from its HTML by live's converter; if that converter fails, live converts the page itself, as in
-     stock Plane.
+     copy task runs, then goes on as in Plane. A page without a document gets one built from its HTML by
+     live's converter; if that converter fails, live converts the page itself, as in stock Plane. The waits
+     (at most 8 seconds) and the conversion share one budget of 14 seconds, inside live's 20-second request
+     timeout, and Halo's Redis calls time out after a second, so Plane's own read always comes in time;
+     when the budget is used up the page goes to live without a document, as in stock Plane.
    - Saving mirrors Plane's code, with its background tasks started after commit. A save that lacks part of the
      stored document (an API edit that editor never received) is merged with it instead of overwriting it, and
      the missing part is sent to that editor through live. When the stored HTML and document disagree (such a

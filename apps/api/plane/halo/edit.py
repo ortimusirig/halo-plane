@@ -79,7 +79,7 @@ def _convert(html: str):
         raise EditRefused(*TOO_LARGE)
 
 
-def ensure_document(page_pk) -> None:
+def ensure_document(page_pk, timeout: float = live.CONVERT_SECONDS) -> None:
     """Give a page its first document, built from its HTML with live's converter, unless it has one (under the
     page's row lock). updated_at stays: building the document is not a change. Raises live.LiveTooLarge or
     live.LiveUnavailable when live cannot convert it."""
@@ -89,7 +89,7 @@ def ensure_document(page_pk) -> None:
         )
         if page.description_binary:
             return
-        binary, json_data = live.convert_html(page.description_html or "<p></p>")
+        binary, json_data = live.convert_html(page.description_html or "<p></p>", timeout=timeout)
         # Live's converter gives the body only; Plane's own first document also holds the page's name as its
         # title (getBinaryDataFromDocumentEditorHTMLString), which the browser's offline fallback relies on.
         binary = ydoc.with_title(binary, page.name or "")

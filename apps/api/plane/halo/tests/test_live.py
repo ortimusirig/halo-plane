@@ -6,6 +6,7 @@ import base64
 from unittest.mock import patch
 
 import pytest
+import redis
 import requests
 
 from plane.halo import live
@@ -100,3 +101,20 @@ def test_text_without_a_tag_is_sent_to_live_as_a_paragraph(html, sent):
     with patch("plane.halo.live.requests.post", return_value=Reply()) as post:
         live.convert_html(html)
     assert post.call_args.kwargs["json"]["description_html"] == sent
+
+
+
+def test_halo_s_redis_calls_time_out_on_a_redis_that_does_not_answer():
+    """Plane's client waits for ever; Halo's coordination may not hold up a page load."""
+    import time
+
+    from plane.halo import lease
+    from plane.halo.tests.conftest import silent_redis
+
+    assert lease.redis_client().connection_pool.connection_kwargs["socket_timeout"] == lease.SOCKET_SECONDS
+    with silent_redis() as port:
+        client = lease.bounded(redis.Redis(host="127.0.0.1", port=port))
+        started = time.monotonic()
+        with pytest.raises(redis.TimeoutError):
+            client.exists("halo:page-edit:x")
+        assert time.monotonic() - started < 3

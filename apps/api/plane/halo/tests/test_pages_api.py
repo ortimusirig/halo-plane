@@ -942,3 +942,39 @@ def test_web_app_properties_patch_keeps_plane_s_answers(world, api_client):
     Page.objects.filter(pk=world.public.pk).update(is_locked=True)
     response = api_client.patch(_app_page_url(world), {"name": "Renamed"}, format="json")
     assert (response.status_code, response.json()) == (400, {"error": "Page is locked"})
+
+
+
+def test_editor_load_goes_on_when_redis_stops_answering(world, api_client):
+    import redis
+
+    from plane.halo import lease
+    from plane.halo.tests.conftest import silent_redis
+
+    api_client.force_authenticate(user=world.owner.user)
+    with silent_redis() as port, \
+            patch("plane.halo.lease.redis_client", return_value=lease.bounded(redis.Redis(host="127.0.0.1", port=port))):
+        started = time.monotonic()
+        response = api_client.get(_description_url(world))
+        took = time.monotonic() - started
+    assert response.status_code == 200 and took < 5
+
+
+def test_editor_load_keeps_within_its_budget_and_leaves_the_rest_to_live(world, fake_live, api_client):
+    """Halo's waits and its first-document conversion share one budget inside live's 20 s request timeout; when
+    the waits used it up, the page goes to live without a document, which live converts itself (stock Plane)."""
+    from django.utils import timezone
+
+    from plane.halo.models import PageBeingCopied
+
+    page = world.make_page(world.owner, "Fresh copy", "<p>x</p>", binary=False)
+    PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{page.id}/description/"
+    with patch("plane.halo.views.LOAD_WAIT_SECONDS", 0.3), patch("plane.halo.views.LOAD_BUDGET_SECONDS", 1.0):
+        started = time.monotonic()
+        response = api_client.get(url)
+        took = time.monotonic() - started
+    assert response.status_code == 200 and took < 2
+    assert fake_live.calls == []  # under MIN_CONVERT_SECONDS left: no conversion started
+    assert Page.objects.get(pk=page.pk).description_binary is None

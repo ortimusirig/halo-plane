@@ -41,6 +41,12 @@ from .edit import EditRefused, being_copied, edit_page, ensure_document, sanitiz
 from .models import PageBeingCopied, PageTextBehind
 from .tasks import finish_page_copy, track_page_version_after_save
 
+# An editor's page load: live gives up on it after 20 s (apps/live/src/services/api.service.ts), so Halo's waits
+# and its first-document conversion share this budget, and Plane's own read always comes in time.
+LOAD_WAIT_SECONDS = 8
+LOAD_BUDGET_SECONDS = 14
+MIN_CONVERT_SECONDS = 2
+
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
 CREATE_FIELDS = {"name", "description_html", "access"}
@@ -402,21 +408,23 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
         # A load waits a moment for Halo's own work on the page (an API edit, or a new copy's copy task) and is
         # never refused: past the wait it goes on as in Plane. An API edit that commits later still reaches the
         # editor through live, and a save that missed it is merged.
+        start = time.monotonic()
+        waits_end = start + min(lease.WAIT_SECONDS, LOAD_WAIT_SECONDS)
         try:
-            lease.wait_until_free(page_id)
-        except Exception as error:  # Redis down: the stored page still loads, as in Plane
+            lease.wait_until_free(page_id, seconds=max(0.0, waits_end - time.monotonic()))
+        except Exception as error:  # Redis down or silent: the stored page still loads, as in Plane
             log_exception(error)
-        deadline = time.monotonic() + lease.WAIT_SECONDS
-        while being_copied(page_id) and time.monotonic() < deadline:
+        while being_copied(page_id) and time.monotonic() < waits_end:
             time.sleep(0.2)
         page = self._visible_page(request, slug, project_id, page_id)
-        if page is not None and not page.description_binary:
+        left = start + LOAD_BUDGET_SECONDS - time.monotonic()
+        if page is not None and not page.description_binary and left >= MIN_CONVERT_SECONDS:
             try:
-                ensure_document(page.pk)
+                ensure_document(page.pk, timeout=min(live.CONVERT_SECONDS, left))
             except (live.LiveTooLarge, live.LiveUnavailable) as error:
-                # Left to live, which converts the page itself, as in stock Plane. API edits need a document
-                # (ensure_document) and are refused while the page is open, so none can race live's conversion.
                 log_exception(error)
+        # A page still without a document is left to live, which converts it itself, as in stock Plane. API edits
+        # need a document (ensure_document) and are refused while the page is open, so none can race that.
         return super().retrieve(request, slug, project_id, page_id)
 
     def partial_update(self, request, slug, project_id, page_id):
