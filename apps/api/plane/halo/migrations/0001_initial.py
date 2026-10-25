@@ -16,6 +16,7 @@ class Migration(migrations.Migration):
             fields=[
                 ("page_id", models.UUIDField(primary_key=True, serialize=False)),
                 ("since", models.DateTimeField()),
+                ("indexed_html", models.TextField(blank=True, null=True)),
             ],
             options={"db_table": "halo_page_text_behind"},
         ),

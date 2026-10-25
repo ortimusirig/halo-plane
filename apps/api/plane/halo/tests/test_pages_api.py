@@ -1091,3 +1091,44 @@ def test_copy_task_copies_uploaded_images_and_leaves_web_images_alone(world):
     assert 'src="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"' in html and 'src="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"' in html
     assert 'src="https://example.com/logo.png"' in html
     assert "11111111-1111" not in html and "22222222-2222" not in html
+
+
+def test_mentions_removed_in_a_merged_save_leave_plane_s_index(world, fake_live, api_client, no_celery,
+                                                               django_capture_on_commit_callbacks):
+    """A stale editor removes a mention while it misses an API edit; its merged save is not indexed, and its
+    next complete save is indexed against the HTML the index saw last, so the mention's row goes."""
+    from plane.bgtasks.page_transaction_task import page_transaction
+    from plane.db.models import PageLog
+
+    mention = '<mention-component id="m1" entity_name="user_mention" entity_identifier="u1"></mention-component>'
+    with_mention = f"<p>Alpha</p><p>Beta {mention}</p><p>Gamma</p>"
+    Page.objects.filter(pk=world.public.pk).update(description_html=with_mention)
+    page_transaction(new_description_html=with_mention, old_description_html=None, page_id=world.public.id)
+    assert PageLog.objects.filter(page_id=world.public.id, transaction="m1").exists()
+    stale = Doc()
+    stale.apply_update(bytes(world.public.description_binary))
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    assert world.owner.client.patch(url, {"append_html": "<p>Delta by AURA</p>", "expected_updated_at": stamp},
+                                    format="json").status_code == 200
+    text = stale.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")
+    api_client.force_authenticate(user=world.owner.user)
+    published = []
+    with patch("plane.halo.live.publish_update", side_effect=lambda page_id, update: published.append(update) or 1), \
+            django_capture_on_commit_callbacks(execute=True):
+        merged = api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p>"}, format="json")  # mention removed
+    assert merged.status_code == 200 and published
+    no_celery.reset_mock()
+    stale.apply_update(published[0])  # the editor gets what it missed, then saves the whole text
+    with django_capture_on_commit_callbacks(execute=True):
+        complete = api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"}, format="json")
+    assert complete.status_code == 200
+    indexing = [call.kwargs for call in no_celery.call_args_list if "new_description_html" in call.kwargs]
+    assert len(indexing) == 1 and mention in indexing[0]["old_description_html"]
+    page_transaction(**indexing[0])
+    assert not PageLog.objects.filter(page_id=world.public.id, transaction="m1").exists()

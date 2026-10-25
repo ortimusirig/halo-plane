@@ -463,18 +463,28 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             # What was written, as Plane's serializer saw it (an empty value is written too).
             html_saved = "description_html" in serializer.validated_data
             document_saved = "description_binary" in serializer.validated_data
+            mark = PageTextBehind.objects.filter(page_id=page.pk).first()
+            indexed_html = old_description_html  # what Plane's mention index saw last
             if merged or html_saved != document_saved:
                 # The stored HTML and document disagree (a merged save, or a save of only one of them): marked
-                # until a complete save, of both the whole document and its HTML.
-                PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
-            elif document_saved:
-                PageTextBehind.objects.filter(page_id=page.pk).delete()
+                # until a complete save, of both the whole document and its HTML. A merged save is not indexed
+                # (its HTML lacks what the editor missed), so the mark keeps the HTML the index last saw.
+                if mark is None:
+                    PageTextBehind.objects.create(page_id=page.pk, since=timezone.now(),
+                                                  indexed_html=old_description_html if merged else None)
+                elif merged and mark.indexed_html is None:
+                    mark.indexed_html = old_description_html
+                    mark.save(update_fields=["indexed_html"])
+            elif document_saved and mark is not None:
+                if mark.indexed_html is not None:
+                    indexed_html = mark.indexed_html
+                mark.delete()
             if data.get("description_html") and not merged:
-                # A merged save's HTML lacks what the editor missed (an API edit's mentions or embeds), so it would
-                # drop them from Plane's index; the editor's next, complete save indexes the whole text.
+                # Plane's index compares against the HTML it saw last: after merged saves, the one kept in the
+                # mark, so mentions removed or added meanwhile are all taken in.
                 new_html = data["description_html"]
                 transaction.on_commit(lambda: _queue(
-                    page_transaction, new_description_html=new_html, old_description_html=old_description_html,
+                    page_transaction, new_description_html=new_html, old_description_html=indexed_html,
                     page_id=page_id))
             if not merged:
                 # A merged save's HTML is that editor's older text, so it makes no version; the editor's next

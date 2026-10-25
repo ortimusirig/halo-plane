@@ -8,11 +8,14 @@ from django.db import models
 
 
 class PageTextBehind(models.Model):
-    """A page whose stored HTML lags its document: an editor's save was merged with an API edit it had not
-    received. Written in the same transaction as that save; removed by the editor's next complete save."""
+    """A page whose stored HTML and document disagree (an editor's save merged with an API edit it had not
+    received, or a save of only one of them). Written in the same transaction as that save; removed by the next
+    complete save. indexed_html: for a merged save, the page's HTML as Plane's mention index last saw it (the
+    merged save's own HTML is not indexed), so the next complete save indexes against it."""
 
     page_id = models.UUIDField(primary_key=True)
     since = models.DateTimeField()
+    indexed_html = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "halo_page_text_behind"
