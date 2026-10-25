@@ -81,10 +81,15 @@ Halo. Only then switch the backend services to the image.
      merged save, or a save of only one of them) the page is marked in Halo's own table
      (`halo_page_text_behind`, same transaction) until a save of both: Halo's API then reports
      `text_complete: false` and its edits wait, and the merged save makes no page version.
-   - Properties, lock and access run Plane's own code after locking the page's row, so none of them can write
-     old text back over an API edit that committed in between. The properties PATCH writes `description_html`
-     as in Plane (the web app's store sends its whole copy of the page); when that changes the HTML, the page
-     is marked as above.
+   - Lock, unlock and access run Plane's own code after locking the page's row, so none of them can write
+     old text back over an API edit that committed in between. The properties PATCH is a copy of Plane's
+     `PageViewSet.partial_update` (same checks, serializer and answers; fingerprinted by the upgrade gate) under
+     the same row lock, with its `page_transaction` task queued after commit, so a broker failure cannot undo
+     the save. It writes `description_html` as in Plane (the web app's store sends its whole copy of the page);
+     when that changes the HTML, the page is marked as above.
+   - When Redis or the task broker fail, Plane's routes behave as in Plane: a page still loads from the
+     database, a saved change is still answered as saved, and Halo's coordination steps are logged and
+     skipped.
    - Duplicate (`HaloPageDuplicateEndpoint`) repeats Plane's steps and locks the source page. When the
      source's stored HTML lags its document (marked as above), the copy takes the document, the authoritative
      part, and the same mark, instead of being rebuilt from that HTML alone. Plane's copy task (it copies the

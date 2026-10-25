@@ -273,3 +273,20 @@ def test_an_append_to_a_page_with_unknown_json_does_not_claim_the_added_blocks_a
     page = Page.objects.get(pk=world.public.pk)
     assert page.description_json == {}  # Plane's version viewer then shows the HTML
     assert page.description_html == ORIGINAL + "<p>Added</p>"
+
+
+
+@pytest.mark.django_db
+def test_a_failed_lease_release_does_not_hide_a_saved_edit(world, fake_live):
+    """Redis failing after the commit: the edit is saved and answered; the lease key expires by itself."""
+    from unittest.mock import MagicMock
+
+    import redis
+
+    client = MagicMock()
+    client.set.return_value = True
+    client.eval.side_effect = redis.ConnectionError("redis went away")
+    with patch("plane.halo.lease.redis_instance", return_value=client):
+        result = _edit(world, html="<p>Alpha</p><p>Beta, saved</p><p>Gamma</p>")
+    assert result["changed"] and result["after_version_id"]
+    assert "Beta, saved" in Page.objects.get(pk=world.public.pk).description_html

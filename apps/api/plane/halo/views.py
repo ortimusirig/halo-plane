@@ -262,17 +262,47 @@ class HaloAppPageViewSet(PageViewSet):
         Page.objects.select_for_update().filter(pk=page_id).first()
 
     def partial_update(self, request, slug, project_id, page_id):
+        """Plane's PageViewSet.partial_update (the same checks, serializer and answers; fingerprinted by the
+        upgrade gate) under the page's row lock, with its page_transaction task queued after commit, so a broker
+        failure cannot undo the save. It writes description_html without the document, as in Plane (the web app's
+        store sends its whole copy of the page); when that changes the HTML the page is marked, so Halo's API
+        reports text_complete false and waits for the next complete editor save."""
         with transaction.atomic():
-            before = Page.objects.select_for_update().filter(pk=page_id).values_list("description_html", flat=True)
-            before = before.first()
-            response = super().partial_update(request, slug, project_id, page_id)
-            after = Page.objects.filter(pk=page_id).values_list("description_html", flat=True).first()
-            if after != before:
-                # Plane's page PATCH writes description_html without the document (the web app's store sends its
-                # whole copy of the page). Plane's behaviour is kept; the page is marked, so Halo's API reports
-                # text_complete false and waits until the next complete editor save.
-                PageTextBehind.objects.update_or_create(page_id=page_id, defaults={"since": timezone.now()})
-            return response
+            try:
+                page = Page.objects.select_for_update(of=("self",)).get(
+                    pk=page_id, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
+                )
+                if page.is_locked:
+                    return Response({"error": "Page is locked"}, status=status.HTTP_400_BAD_REQUEST)
+                parent = request.data.get("parent", None)
+                if parent:
+                    _ = Page.objects.get(
+                        pk=parent, workspace__slug=slug, projects__id=project_id, project_pages__deleted_at__isnull=True
+                    )
+                # Only update access if the page owner is the requesting  user
+                if page.access != request.data.get("access", page.access) and page.owned_by_id != request.user.id:
+                    return Response(
+                        {"error": "Access cannot be updated since this page is owned by someone else"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                serializer = PageDetailSerializer(page, data=request.data, partial=True)
+                page_description = page.description_html
+                if serializer.is_valid():
+                    serializer.save()
+                    if page.description_html != page_description:
+                        PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
+                    if request.data.get("description_html"):
+                        new_html = request.data.get("description_html", "<p></p>")
+                        transaction.on_commit(lambda: _queue(
+                            page_transaction, new_description_html=new_html, old_description_html=page_description,
+                            page_id=page_id))
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            except Page.DoesNotExist:
+                return Response(
+                    {"error": "Access cannot be updated since this page is owned by someone else"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
     def lock(self, request, slug, project_id, page_id):
         with transaction.atomic():
@@ -372,7 +402,10 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
         # A load waits a moment for Halo's own work on the page (an API edit, or a new copy's copy task) and is
         # never refused: past the wait it goes on as in Plane. An API edit that commits later still reaches the
         # editor through live, and a save that missed it is merged.
-        lease.wait_until_free(page_id)
+        try:
+            lease.wait_until_free(page_id)
+        except Exception as error:  # Redis down: the stored page still loads, as in Plane
+            log_exception(error)
         deadline = time.monotonic() + lease.WAIT_SECONDS
         while being_copied(page_id) and time.monotonic() < deadline:
             time.sleep(0.2)

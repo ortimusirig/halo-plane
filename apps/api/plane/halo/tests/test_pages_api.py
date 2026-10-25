@@ -902,3 +902,39 @@ def test_copy_task_leaves_a_copied_document_someone_changed_meanwhile(world):
         _finish(world, copy)
     after = Page.objects.get(pk=copy.pk)
     assert bytes(after.description_binary) == edited and after.description_html == IMAGE_HTML
+
+
+
+def test_editor_load_works_while_redis_is_down(world, api_client):
+    """Plane reads the stored page from the database; a Redis outage must not stop that (nor live's fallback)."""
+    import redis
+
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.lease.wait_until_free", side_effect=redis.ConnectionError("redis is down")):
+        assert api_client.get(_description_url(world)).status_code == 200
+
+
+def test_web_app_properties_patch_is_saved_although_the_broker_is_down(world, api_client):
+    """As in Plane, the save stands; the page task is queued after commit and its failure only logged."""
+    from plane.halo.models import PageTextBehind
+
+    api_client.force_authenticate(user=world.owner.user)
+    with patch("plane.halo.views.page_transaction") as page_transaction:
+        page_transaction.delay.side_effect = RuntimeError("broker down")
+        response = api_client.patch(_app_page_url(world), {"name": "Renamed", "description_html": "<p>New text</p>"},
+                                    format="json")
+    assert response.status_code == 200, response.content
+    page = Page.objects.get(pk=world.public.pk)
+    assert (page.name, page.description_html) == ("Renamed", "<p>New text</p>")
+    assert PageTextBehind.objects.filter(page_id=world.public.id).exists()
+
+
+def test_web_app_properties_patch_keeps_plane_s_answers(world, api_client):
+    """Halo's copy of Plane's properties PATCH answers as Plane does: locked page, others' access change."""
+    api_client.force_authenticate(user=world.member.user)
+    response = api_client.patch(_app_page_url(world), {"access": 1}, format="json")
+    assert (response.status_code, response.json()) == (
+        400, {"error": "Access cannot be updated since this page is owned by someone else"})
+    Page.objects.filter(pk=world.public.pk).update(is_locked=True)
+    response = api_client.patch(_app_page_url(world), {"name": "Renamed"}, format="json")
+    assert (response.status_code, response.json()) == (400, {"error": "Page is locked"})

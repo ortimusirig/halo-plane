@@ -172,11 +172,14 @@ for node in ast.parse(src).body:
         print(digest(node))
 ' "$work/apps/api/plane/$1" "$2"
 }
-mirrored() {  # <class name> <expected fingerprint> <route suffix> <Halo class>: Halo's subclass copies that code
+mirrored() {  # <class> <expected fingerprint> <route suffix> <Halo class> [method]: Halo's subclass copies that code
   local found
   found=$(fingerprint app/views/page/base.py "$1")
+  if [ -n "${5:-}" ]; then
+    found=$(echo "$found" | tr ' ' '\n' | grep "^$5=" || true)
+  fi
   if [ "$found" = "$2" ] \
-    && grep -qF "/pages/<uuid:page_id>/$3/" "$work/apps/api/plane/app/urls/page.py"; then
+    && grep -qF "/pages/<uuid:page_id>/${3:+$3/}\"" "$work/apps/api/plane/app/urls/page.py"; then
     echo "OK   Plane's $1 is unchanged (Halo's $4 mirrors it)"
   else
     echo "OPEN Plane's $1 changed ($found): port the change to $4 in plane/halo/views.py and update release.conf"
@@ -185,6 +188,7 @@ mirrored() {  # <class name> <expected fingerprint> <route suffix> <Halo class>:
 }
 mirrored PagesDescriptionViewSet "$UPSTREAM_DESCRIPTION_FINGERPRINT" description HaloPagesDescriptionViewSet
 mirrored PageDuplicateEndpoint "$UPSTREAM_DUPLICATE_FINGERPRINT" duplicate HaloPageDuplicateEndpoint
+mirrored PageViewSet "$UPSTREAM_PAGE_FINGERPRINT" "" HaloAppPageViewSet partial_update
 copy_found=$(for name in copy_s3_objects_of_description_and_assets copy_assets extract_asset_ids replace_asset_ids; do
   fingerprint bgtasks/copy_s3_object.py "$name"
 done | tr '\n' ' ' | sed 's/ $//')

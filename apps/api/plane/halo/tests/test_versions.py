@@ -72,3 +72,23 @@ def test_cap_drops_the_oldest_beyond_twenty(world):
     assert {before.id, after.id} <= set(left.values_list("id", flat=True))
     assert not left.filter(description_html="<p>0</p>").exists()
     assert not left.filter(description_html="<p>1</p>").exists()
+
+
+
+@pytest.mark.django_db
+def test_the_cap_needs_no_task_broker(world):
+    """Pruning is a soft delete in the database alone, so a broker failure cannot undo the edit around it."""
+    from unittest.mock import patch
+
+    page = world.public
+    start = timezone.now() - timedelta(days=1)
+    for minute in range(20):
+        PageVersion.objects.create(page=page, workspace=page.workspace, owned_by=world.owner.user,
+                                   last_saved_at=start + timedelta(minutes=minute), description_html=f"<p>{minute}</p>")
+    old = _old(page)
+    page.description_html = "<p>Changed</p>"
+    page.save()
+    with patch("celery.app.task.Task.delay", side_effect=RuntimeError("broker down")):
+        versions.record_edit(page, world.owner.user.id, old)
+    assert PageVersion.objects.filter(page=page).count() == versions.MAX_VERSIONS
+    assert PageVersion.all_objects.filter(page=page, deleted_at__isnull=False).count() == 2

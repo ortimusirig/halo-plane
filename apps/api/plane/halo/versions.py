@@ -45,8 +45,12 @@ def record_edit(page, user_id, old: dict):
         page.description_binary,
         page.description_json,
     )
-    surplus = PageVersion.objects.filter(page_id=page.id).order_by("-last_saved_at")[MAX_VERSIONS:]
-    for version in surplus:
-        if version.id not in (before.id, after.id):
-            version.delete()
+    surplus = [
+        version.id
+        for version in PageVersion.objects.filter(page_id=page.id).order_by("-last_saved_at")[MAX_VERSIONS:]
+        if version.id not in (before.id, after.id)
+    ]
+    # Plane's soft delete, done in the database alone: an instance delete also queues a task, and a broker failure
+    # there would undo the whole edit.
+    PageVersion.objects.filter(pk__in=surplus).delete()
     return before, after
