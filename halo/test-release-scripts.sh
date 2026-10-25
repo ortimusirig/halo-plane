@@ -95,5 +95,24 @@ expect "no downgrade" 1 "never downgrades" order v1.4.2 v1.4.1 v1.4.1 v1.4.2 v1.
 expect "no same release" 1 "never downgrades" order v1.4.2 v1.4.2 v1.4.2 v1.4.3
 expect "a malformed tag is refused" 64 "not a Plane release tag" order v1.4.2 latest v1.4.3
 
+# The caller scan the gate uses, on made-up files: each way of calling Plane's task shows up.
+calls="$scratch/calls/apps/api/plane"
+mkdir -p "$calls/app/views" "$calls/bgtasks"
+printf '%s\n' "from plane.bgtasks.page_transaction_task import page_transaction as pt" \
+  "from plane.bgtasks import page_transaction_task as ptt" "" "def aliased():" "    pt.delay(1)" "" \
+  "class Q:" "    def qualified(self):" "        ptt.page_transaction.apply_async(())" > "$calls/app/views/extra.py"
+printf '%s\n' "from .page_transaction_task import page_transaction" "" "def relative():" \
+  "    page_transaction.s()" > "$calls/bgtasks/relative.py"
+printf '%s\n' "from plane.bgtasks.page_transaction_task import page_transaction as index" "" \
+  "def page_transaction(**kwargs):" "    index.delay(**kwargs)" > "$calls/app/views/wrapper.py"
+expect "caller scan finds an aliased caller" 0 "app/views/extra.py:aliased" \
+  "$py" halo/index_callers.py callers "$scratch/calls"
+expect "caller scan finds a qualified caller" 0 "app/views/extra.py:Q.qualified" \
+  "$py" halo/index_callers.py callers "$scratch/calls"
+expect "caller scan finds a relative import" 0 "bgtasks/relative.py:relative" \
+  "$py" halo/index_callers.py callers "$scratch/calls"
+expect "caller scan finds a wrapper named like the task" 0 "app/views/wrapper.py:page_transaction" \
+  "$py" halo/index_callers.py callers "$scratch/calls"
+
 echo "${failures} failed"
 [ "$failures" = 0 ]

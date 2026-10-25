@@ -11,7 +11,7 @@ class PageTextBehind(models.Model):
     """A page whose stored HTML and document disagree (an editor's save merged with an API edit it had not
     received, or a save of only one of them). Written in the same transaction as that save; removed by the next
     complete save, which also brings Plane's mention index in line with the whole text. merged: the stored HTML
-    is a merged save's (it lacks what that editor missed), so the index is not brought in line with it."""
+    is a merged save's (it lacks what that editor missed); until the mark is cleared, saves index add-only."""
 
     page_id = models.UUIDField(primary_key=True)
     since = models.DateTimeField()

@@ -60,12 +60,26 @@ def _indexed_html(page_id) -> str:
 
 
 @shared_task
+def add_to_index(page_id, html):
+    """Plane's page_transaction in the form Plane's create uses (old None: the HTML's entries added, none deleted),
+    for a save made while the page is merged-marked (views): its document keeps parts that HTML may lack, and a
+    deleted entry could not come back (PageLog is unique per page and transaction; Plane's delete is a soft
+    delete). Runs under the page's row lock and only while the page is still merged-marked: after the mark is
+    cleared it does nothing, since the clearing save's index_page reconciles the whole text."""
+    with transaction.atomic():
+        page = Page.objects.select_for_update().filter(pk=page_id).only("id").first()
+        if page is None or not PageTextBehind.objects.filter(page_id=page_id, merged=True).exists():
+            return
+        page_transaction(new_description_html=html, old_description_html=None, page_id=page_id)
+
+
+@shared_task
 def index_page(page_id):
     """Plane's mention index (PageLog) brought in line with the page's stored text, both read when the job runs,
-    under the page's row lock. Queued only by the complete save that clears a merged mark (views): the merged
-    saves before it were not indexed, so Plane's diff against the stored HTML would not do. Every other save keeps
-    Plane's own page_transaction. A page merged-marked again by the time the job runs is left alone; the save that
-    clears that mark queues the job again."""
+    under the page's row lock. Queued only by the complete save that clears a merged mark (views): the saves
+    while the page was merged-marked indexed add-only (add_to_index), so the removals they held back, and anything
+    a late add_to_index added, are settled here. Every other save keeps Plane's own page_transaction. A page
+    merged-marked again by the time the job runs is left alone; the save that clears that mark queues it again."""
     with transaction.atomic():
         page = Page.objects.select_for_update().filter(pk=page_id).only("description_html").first()
         if page is None or PageTextBehind.objects.filter(page_id=page_id, merged=True).exists():

@@ -38,7 +38,7 @@ from plane.utils.exception_logger import log_exception
 from . import live, ydoc
 from .edit import EditRefused, edit_page, first_document, sanitize, text_behind
 from .models import PageBeingCopied, PageTextBehind
-from .tasks import finish_page_copy, index_page, track_page_version_after_save
+from .tasks import add_to_index, finish_page_copy, index_page, track_page_version_after_save
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -320,15 +320,20 @@ class HaloAppPageViewSet(PageViewSet):
                     )
                 serializer = PageDetailSerializer(page, data=request.data, partial=True)
                 page_description = page.description_html
+                merged_marked = PageTextBehind.objects.filter(page_id=page.pk, merged=True).exists()
                 if serializer.is_valid():
                     serializer.save()
                     if page.description_html != page_description:
                         PageTextBehind.objects.update_or_create(page_id=page.pk, defaults={"since": timezone.now()})
                     if request.data.get("description_html"):
                         new_html = request.data.get("description_html", "<p></p>")
-                        transaction.on_commit(lambda: _queue(
-                            page_transaction, new_description_html=new_html, old_description_html=page_description,
-                            page_id=page_id))
+                        if merged_marked:
+                            # The document keeps parts the stored HTML may lack: add-only (tasks.add_to_index).
+                            transaction.on_commit(lambda: _queue(add_to_index, page_id=page_id, html=new_html))
+                        else:
+                            transaction.on_commit(lambda: _queue(
+                                page_transaction, new_description_html=new_html,
+                                old_description_html=page_description, page_id=page_id))
                     return Response(serializer.data, status=status.HTTP_200_OK)
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             except Page.DoesNotExist:
@@ -463,10 +468,10 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
             # What was written, as Plane's serializer saw it (an empty value is written too).
             html_saved = "description_html" in serializer.validated_data
             document_saved = "description_binary" in serializer.validated_data
+            merged_marked = PageTextBehind.objects.filter(page_id=page.pk, merged=True).exists()
             cleared_merged = False
             if merged:
-                # The stored HTML is now that editor's older text: marked (merged) until a complete save, and not
-                # indexed meanwhile (it lacks an API edit's mentions or embeds).
+                # The stored HTML is now that editor's older text: marked (merged) until a complete save.
                 PageTextBehind.objects.update_or_create(page_id=page.pk,
                                                         defaults={"since": timezone.now(), "merged": True})
             elif html_saved != document_saved:
@@ -479,15 +484,20 @@ class HaloPagesDescriptionViewSet(PagesDescriptionViewSet):
                     cleared_merged = mark.merged
                     mark.delete()
             if cleared_merged:
-                # The first complete save after merged saves, which were not indexed: Plane's diff against the
-                # stored HTML would miss their changes, so Halo's job brings the index in line with the text.
+                # The complete save that ends the merged-marked state: Halo's job brings the index in line with
+                # the stored text (the removals the add-only saves held back).
                 transaction.on_commit(lambda: _queue(index_page, page_id=page_id))
-            elif data.get("description_html") and not merged:
-                # Every other save: Plane's own indexing, with Plane's arguments.
+            elif data.get("description_html"):
                 new_html = data["description_html"]
-                transaction.on_commit(lambda: _queue(
-                    page_transaction, new_description_html=new_html, old_description_html=old_description_html,
-                    page_id=page_id))
+                if merged or merged_marked:
+                    # The document keeps parts this HTML lacks, and Plane's delete of an entry is permanent (a soft
+                    # delete, unique per page): add-only, through Plane's own task (tasks.add_to_index).
+                    transaction.on_commit(lambda: _queue(add_to_index, page_id=page_id, html=new_html))
+                else:
+                    # Plane's own indexing, with Plane's arguments.
+                    transaction.on_commit(lambda: _queue(
+                        page_transaction, new_description_html=new_html, old_description_html=old_description_html,
+                        page_id=page_id))
             if not merged:
                 # A merged save's HTML is that editor's older text, so it makes no version; the editor's next
                 # save, complete because it received the missing part, does.

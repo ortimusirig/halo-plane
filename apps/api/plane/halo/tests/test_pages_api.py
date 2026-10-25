@@ -272,9 +272,9 @@ def test_editor_save_that_missed_an_api_edit_is_merged(world, fake_live, api_cli
             format="json",
         )
     assert response.status_code == 200, response.content
-    # A merged save queues nothing: its HTML is older, so no version and no mention index from it (that would
-    # drop the API edit's mentions from Plane's index); the editor's next, complete save does both.
-    assert len(callbacks) == 0
+    # A merged save queues only add-only indexing (tasks.add_to_index): its HTML is older, so no version, and no
+    # index entry is deleted (that would drop the API edit's mentions); the editor's next, complete save does both.
+    assert len(callbacks) == 1
     saved = Doc()
     saved.apply_update(bytes(Page.objects.get(pk=world.public.pk).description_binary))
     assert str(saved.get(ydoc.BODY, type=XmlFragment)) == (
@@ -1102,9 +1102,9 @@ def _mention(mention_id):
 
 def _run_queued(no_celery):
     """Run the queued indexing in queue order, as the worker does: Plane's page_transaction and Halo's
-    index_page (the other queued tasks do not touch the index)."""
+    index_page and add_to_index (the other queued tasks do not touch the index)."""
     from plane.bgtasks.page_transaction_task import page_transaction
-    from plane.halo.tasks import index_page
+    from plane.halo.tasks import add_to_index, index_page
 
     ran = []
     for call in no_celery.call_args_list:
@@ -1114,6 +1114,9 @@ def _run_queued(no_celery):
         elif set(call.kwargs) == {"page_id"}:
             index_page(**call.kwargs)
             ran.append("index_page")
+        elif set(call.kwargs) == {"page_id", "html"}:
+            add_to_index(**call.kwargs)
+            ran.append("add_to_index")
     no_celery.reset_mock()
     return ran
 
@@ -1137,8 +1140,8 @@ def _api_append(world):
 
 def test_mentions_removed_in_a_merged_save_leave_plane_s_index(world, fake_live, api_client, no_celery,
                                                                django_capture_on_commit_callbacks):
-    """A stale editor removes a mention while it misses an API edit; its merged save is not indexed, and the
-    complete save that follows reconciles the index with the whole text in the worker."""
+    """A stale editor removes a mention while it misses an API edit; its merged save deletes no index entry, and
+    the complete save that follows reconciles the index with the whole text in the worker."""
     from plane.bgtasks.page_transaction_task import page_transaction
     from plane.db.models import PageLog
 
@@ -1160,7 +1163,7 @@ def test_mentions_removed_in_a_merged_save_leave_plane_s_index(world, fake_live,
             "description_binary": base64.b64encode(stale.get_update()).decode(),
             "description_html": "<p>Alpha typed</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"},
             format="json").status_code == 200
-    assert _run_queued(no_celery) == ["index_page"]  # the merged save queued no indexing
+    assert _run_queued(no_celery) == ["add_to_index", "index_page"]  # add-only (a no-op once cleared), then Halo's
     assert not PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
 
 
@@ -1185,15 +1188,16 @@ def test_a_mention_indexed_between_a_merged_and_a_complete_save_is_removed_when_
             "description_binary": base64.b64encode(stale.get_update()).decode(),
             "description_html": "<p>Alpha</p><p>Beta</p><p>Gamma</p><p>Delta by AURA</p>"},
             format="json").status_code == 200
-    assert _run_queued(no_celery) == ["page_transaction", "index_page"]  # Plane's own, then Halo's on clearing
+    assert _run_queued(no_celery) == ["add_to_index", "add_to_index", "index_page"]  # the HTML-only one too
     assert not PageLog.objects.filter(page_id=world.public.id, transaction=NEW_MENTION_ID).exists()
 
 
 def test_an_index_job_leaves_a_page_alone_while_a_merged_save_s_text_is_stored(world, fake_live, api_client,
                                                                                 no_celery,
                                                                                 django_capture_on_commit_callbacks):
-    """A complete save queues an index job; another stale editor's merged save lands before it runs. The job must
-    not index that older text (it would drop mentions the document has); the next complete save's job does."""
+    """A complete save keeps a mention; another stale editor's merged save, without it, lands before the jobs
+    run. Neither job may drop the mention the document has (the merged save's is add-only); nor does the next
+    complete save's index job."""
     from plane.bgtasks.page_transaction_task import page_transaction
     from plane.db.models import PageLog
 
@@ -1212,7 +1216,7 @@ def test_an_index_job_leaves_a_page_alone_while_a_merged_save_s_text_is_stored(w
             "description_binary": base64.b64encode(current.get_update()).decode(),
             "description_html": with_mention + "<p>Delta by AURA</p>"}, format="json").status_code == 200
         missing = _merged_save(world, api_client, stale, ORIGINAL)  # older text, without the mention
-    assert _run_queued(no_celery) == ["page_transaction"]  # the complete save's own, run after the merged save
+    assert _run_queued(no_celery) == ["page_transaction", "add_to_index"]  # the complete save's, the merged one's
     assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
     stale.apply_update(missing)
     with django_capture_on_commit_callbacks(execute=True):
@@ -1244,3 +1248,104 @@ def test_ordinary_saves_keep_plane_s_own_mention_indexing(world, api_client, no_
         {"new_description_html": typed, "old_description_html": ORIGINAL, "page_id": world.public.id},
         {"new_description_html": ORIGINAL, "old_description_html": typed, "page_id": world.public.id},
     ]
+
+
+def test_a_merged_save_that_missed_only_the_copy_task_indexes_its_new_mention_at_once(
+        world, api_client, no_celery, django_capture_on_commit_callbacks):
+    """No API edit: an editor of a duplicate missed the copy task's image change, adds a mention and saves. The
+    save is merged (the image change is kept) and its mention is indexed at once, through Plane's own task."""
+    from plane.db.models import PageLog
+
+    copy = _copy_with_json(world)
+    stale = Doc()
+    stale.apply_update(bytes(copy.description_binary))
+    with patch("plane.halo.tasks.copy_assets", return_value=COPIED), patch("plane.halo.live.publish_update"):
+        _finish(world, copy)
+    text = stale.get(ydoc.BODY, type=XmlFragment).children[0].children[0]
+    text.insert(len(text), " typed")
+    api_client.force_authenticate(user=world.owner.user)
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{copy.id}/description/"
+    html = (f'<p>Alpha typed {_mention(NEW_MENTION_ID)}</p>'
+            '<image-component src="0a0a0a0a-0000-4000-8000-0000000000aa"></image-component>')
+    no_celery.reset_mock()
+    with patch("plane.halo.live.publish_update", return_value=1) as publish, \
+            django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(url, {"description_binary": base64.b64encode(stale.get_update()).decode(),
+                                      "description_html": html}, format="json").status_code == 200
+    assert publish.called  # merged: the editor gets the image change it missed
+    after = Page.objects.get(pk=copy.pk)
+    assert ydoc.image_sources(bytes(after.description_binary)) == ["0b0b0b0b-0000-4000-8000-0000000000bb"]
+    indexing = [call.kwargs for call in no_celery.call_args_list if "html" in call.kwargs]
+    assert indexing == [{"page_id": copy.id, "html": html}]
+    assert _run_queued(no_celery) == ["add_to_index"]
+    assert PageLog.objects.filter(page_id=copy.id, transaction=NEW_MENTION_ID).exists()
+
+
+def test_a_stale_save_after_another_editor_s_complete_save_keeps_an_api_edit_s_mention(
+        world, fake_live, api_client, no_celery, django_capture_on_commit_callbacks):
+    """An API edit adds a mention; editor A saves completely; editor B, stale since before the API edit, saves
+    without the mention (merged), then saves completely once it has the missing part. Run in queue order with
+    Plane's real task, the mention's entry is never deleted (a deleted one could not come back)."""
+    from plane.bgtasks.page_transaction_task import page_transaction
+    from plane.db.models import PageLog
+
+    stale = Doc()
+    stale.apply_update(bytes(world.public.description_binary))
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    no_celery.reset_mock()
+    assert world.owner.client.patch(url, {"append_html": f"<p>Delta {_mention(MENTION_ID)}</p>",
+                                          "expected_updated_at": stamp}, format="json").status_code == 200
+    edits = [call.kwargs for call in no_celery.call_args_list if "new_description_html" in call.kwargs]
+    no_celery.reset_mock()
+    for kwargs in edits:  # the API edit's own page_transaction
+        page_transaction(**kwargs)
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+    stored = Page.objects.get(pk=world.public.pk)
+    current = Doc()
+    current.apply_update(bytes(stored.description_binary))
+    api_client.force_authenticate(user=world.owner.user)
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {  # editor A: complete
+            "description_binary": base64.b64encode(current.get_update()).decode(),
+            "description_html": stored.description_html}, format="json").status_code == 200
+        missing = _merged_save(world, api_client, stale, ORIGINAL)  # editor B: stale, without the mention
+    assert _run_queued(no_celery) == ["page_transaction", "add_to_index"]
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+    stale.apply_update(missing)
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {  # editor B: complete
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": stored.description_html}, format="json").status_code == 200
+    assert _run_queued(no_celery) == ["index_page"]
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+
+
+def test_a_properties_patch_while_merged_marked_never_drops_a_mention_the_document_keeps(
+        world, fake_live, api_client, no_celery, django_capture_on_commit_callbacks):
+    """A stale editor's merged save adds a mention; a properties PATCH sends HTML without it while the page is
+    merged-marked; then the complete save. With real PageLog rows, the mention's entry is never deleted."""
+    from plane.db.models import PageLog
+
+    stale = Doc()
+    stale.apply_update(bytes(world.public.description_binary))
+    _api_append(world)
+    no_celery.reset_mock()
+    api_client.force_authenticate(user=world.owner.user)
+    with_mention = f"<p>Alpha</p><p>Beta {_mention(MENTION_ID)}</p><p>Gamma</p>"
+    with django_capture_on_commit_callbacks(execute=True):
+        missing = _merged_save(world, api_client, stale, with_mention)
+    assert _run_queued(no_celery) == ["add_to_index"]
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_app_page_url(world), {"description_html": ORIGINAL},
+                                format="json").status_code == 200
+    assert _run_queued(no_celery) == ["add_to_index"]  # add-only while merged-marked: nothing deleted
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+    stale.apply_update(missing)
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(_description_url(world), {
+            "description_binary": base64.b64encode(stale.get_update()).decode(),
+            "description_html": with_mention + "<p>Delta by AURA</p>"}, format="json").status_code == 200
+    assert _run_queued(no_celery) == ["index_page"]
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()

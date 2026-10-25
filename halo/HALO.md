@@ -86,16 +86,20 @@ Halo. Only then switch the backend services to the image.
      browser's offline fallback's) replaces it, as Plane's save does. When the stored HTML and document
      disagree (a merged save, or a save of only one of them) the page is marked in Halo's own table
      (`halo_page_text_behind`, same transaction) until a save of both: Halo's API then reports
-     `text_complete: false` and its edits wait, and the merged save makes no page version and leaves Plane's
-     mention index alone (its HTML lacks the API edit's parts; the editor's next, complete save updates both).
-   - Plane's mention index (`PageLog`): every ordinary save keeps Plane's own `page_transaction` with Plane's
-     arguments. Only merged saves differ: they are not indexed and mark the page `merged`, and the complete
-     save that clears that mark queues Halo's `tasks.index_page`, which under the page's row lock brings the
-     index in line with the stored text (and leaves a page merged-marked again alone).
+     `text_complete: false` and its edits wait, and the merged save makes no page version (its HTML lacks
+     what that editor missed; the editor's next, complete save makes one).
+   - Plane's mention index (`PageLog`): every save keeps Plane's own `page_transaction` with Plane's arguments
+     while the page is not merged-marked. A merged save marks the page `merged`. While that mark stands, the
+     document keeps parts the stored HTML may lack, and Plane's delete of an entry is permanent (a soft
+     delete; `PageLog` is unique per page and transaction), so every save that writes HTML (merged saves, the
+     properties PATCH, HTML-only saves) queues Halo's `tasks.add_to_index`: under the page's row lock and only
+     while the mark stands, Plane's task in the form its create uses (old `None`: entries added, none
+     deleted). The complete save that clears the mark queues Halo's `tasks.index_page`, which under the row
+     lock brings the index in line with the stored text (and leaves a page merged-marked again alone).
    - Lock, unlock and access run Plane's own code after locking the page's row, so none of them can write
      old text back over an API edit that committed in between. The properties PATCH is a copy of Plane's
      `PageViewSet.partial_update` (same checks, serializer and answers; fingerprinted by the upgrade gate) under
-     the same row lock, with its `page_transaction` task queued after commit, so a broker failure cannot undo
+     the same row lock, with its indexing task queued after commit, so a broker failure cannot undo
      the save. It writes `description_html` as in Plane (the web app's store sends its whole copy of the page);
      when that changes the HTML, the page is marked as above.
    - When Redis or the task broker fail, Plane's routes behave as in Plane: a saved change is still answered
