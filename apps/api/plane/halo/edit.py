@@ -11,8 +11,11 @@ document (ydoc). The update is published on live's channel after commit, and aga
 editor that opened the page in that moment still receives it.
 """
 
+import copy
 import threading
 from datetime import timedelta
+
+from bs4 import BeautifulSoup
 
 from django.db import transaction
 from django.utils import timezone
@@ -44,6 +47,44 @@ def sanitize(html: str) -> str:
     if not valid:
         raise EditRefused(400, "invalid_html", error)
     return live.convertible(clean if clean is not None else html)
+
+
+IMAGE_TAGS = ("image-component", "img")  # the document's imageComponent and image nodes, in the HTML
+IMAGE_NODES = ("imageComponent", "image")
+
+
+def _json_images(node):
+    if isinstance(node, dict):
+        if node.get("type") in IMAGE_NODES and isinstance(node.get("attrs"), dict):
+            yield node
+        for child in node.get("content") or []:
+            yield from _json_images(child)
+
+
+def with_document_image_ids(html: str, json_data, binary: bytes):
+    """The HTML and JSON with each image's id taken from the document, the authoritative part: Plane's mention
+    index keys an image by the id in the HTML, while the document keeps a retained image's own id whatever the
+    edit's HTML said (the id is the editor's own bookkeeping, ignored in the comparison). Images are matched in
+    order, and only when their sources agree; anything else is left as it is."""
+    images = ydoc.image_ids(binary)
+    soup = BeautifulSoup(html, "html.parser")
+    tags = soup.find_all(list(IMAGE_TAGS))
+    if len(tags) == len(images) and all(tag.get("src") == src for tag, (src, _) in zip(tags, images)):
+        changed = False
+        for tag, (_, image_id) in zip(tags, images):
+            if image_id and tag.get("id") != image_id:
+                tag["id"] = image_id
+                changed = True
+        if changed:
+            html = str(soup)
+    nodes = list(_json_images(json_data))
+    if nodes and len(nodes) == len(images) and all(node["attrs"].get("src") == src for node, (src, _) in
+                                                   zip(nodes, images)):
+        json_data = copy.deepcopy(json_data)
+        for node, (_, image_id) in zip(_json_images(json_data), images):
+            if image_id:
+                node["attrs"]["id"] = image_id
+    return html, json_data
 
 
 def _check(page: Page, expected_updated_at) -> None:
@@ -240,6 +281,7 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         if not (body_changed or name_changed):
             return {"changed": False, "before_version_id": None, "after_version_id": None, "open_editors_updated": 0}
         if body_changed:
+            full_html, full_json = with_document_image_ids(full_html, full_json, document.state)
             page.description_html, page.description_json = full_html, full_json
         if document.changed:
             page.description_binary = document.state

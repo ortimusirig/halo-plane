@@ -299,6 +299,17 @@ def image_sources(binary: bytes) -> list[str]:
     return [str(src) for src in sources if src]
 
 
+def image_ids(binary: bytes) -> list[tuple[str | None, str | None]]:
+    """The (src, id) of every image in the body, in order: the id is the one Plane's mention index keys an image
+    by (page_transaction reads it from the HTML), and the document keeps a retained image's own."""
+    images = _images(_load(binary).get(BODY, type=XmlFragment))
+    return [(_text(dict(image.attributes).get("src")), _text(dict(image.attributes).get(EDITOR_ID))) for image in images]
+
+
+def _text(value) -> str | None:
+    return None if value is None or value == "" else str(value)
+
+
 def with_image_sources(binary: bytes, sources: dict) -> bytes:
     """The whole document with each image whose src is a key of sources pointed at its value (a duplicated page's
     own image copies); everything else stays as it is."""

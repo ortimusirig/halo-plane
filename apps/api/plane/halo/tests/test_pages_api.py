@@ -1349,3 +1349,85 @@ def test_a_properties_patch_while_merged_marked_never_drops_a_mention_the_docume
             "description_html": with_mention + "<p>Delta by AURA</p>"}, format="json").status_code == 200
     assert _run_queued(no_celery) == ["index_page"]
     assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
+
+
+def test_a_duplicate_of_a_merged_marked_page_indexes_add_only_until_its_complete_save(
+        world, fake_live, api_client, no_celery, django_capture_on_commit_callbacks):
+    """The source is merged-marked (its document keeps a mention its HTML may lack); the copy takes that document
+    and the mark as it is, merged included. An HTML-only save of the copy without the mention then deletes no
+    index entry, and the copy's complete save keeps it."""
+    from django.utils import timezone
+
+    from plane.db.models import PageLog
+    from plane.halo.models import PageTextBehind
+
+    with_mention = f"<p>Alpha</p><p>Beta {_mention(MENTION_ID)}</p><p>Gamma</p>"
+    Page.objects.filter(pk=world.public.pk).update(description_html=with_mention)
+    PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now(), merged=True)
+    api_client.force_authenticate(user=world.owner.user)
+    with django_capture_on_commit_callbacks(execute=True):
+        response = api_client.post(_app_page_url(world, "duplicate/"))
+    assert response.status_code == 201, response.content
+    copy = Page.objects.get(pk=response.json()["id"])
+    assert PageTextBehind.objects.get(page_id=copy.id).merged is True
+    _run_queued(no_celery)  # the duplicate's own page_transaction (old None)
+    assert PageLog.objects.filter(page_id=copy.id, transaction=MENTION_ID).exists()
+    url = f"/api/workspaces/{world.workspace.slug}/projects/{world.project.id}/pages/{copy.id}/description/"
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(url, {"description_html": ORIGINAL}, format="json").status_code == 200
+    assert _run_queued(no_celery) == ["add_to_index"]
+    assert PageLog.objects.filter(page_id=copy.id, transaction=MENTION_ID).exists()
+    with django_capture_on_commit_callbacks(execute=True):
+        assert api_client.patch(url, {
+            "description_binary": base64.b64encode(bytes(copy.description_binary)).decode(),
+            "description_html": with_mention}, format="json").status_code == 200
+    assert _run_queued(no_celery) == ["index_page"]
+    assert PageLog.objects.filter(page_id=copy.id, transaction=MENTION_ID).exists()
+
+
+IMAGE_ID = "0f0f0f0f-0000-4000-8000-0000000000ff"
+
+
+@pytest.mark.parametrize("sent_id", ["0a1a1a1a-0000-4000-8000-0000000000a1", None])
+def test_an_api_edit_keeps_the_document_s_image_id_in_the_html_and_the_index(world, fake_live, api_client,
+                                                                                 no_celery, sent_id):
+    """The page's image has the editor's id; an API edit changes the text and sends the image with another id, or
+    none. The document keeps the image's own id, so the stored HTML and JSON take it too, and Plane's index keeps
+    the image's entry through the API edit and the editor's next save."""
+    from pycrdt import XmlElement, XmlText
+
+    from plane.bgtasks.page_transaction_task import page_transaction
+    from plane.db.models import PageLog
+    from plane.halo.edit import with_document_image_ids
+
+    src = "0a0a0a0a-0000-4000-8000-0000000000aa"
+    doc = Doc()
+    body = doc.get(ydoc.BODY, type=XmlFragment)
+    with doc.transaction():
+        body.children.append(XmlElement("paragraph", {})).children.append(XmlText()).insert(0, "Alpha")
+        body.children.append(XmlElement("imageComponent", {"src": src, "id": IMAGE_ID}))
+    html = f'<p>Alpha</p><image-component src="{src}" id="{IMAGE_ID}"></image-component>'
+    Page.objects.filter(pk=world.public.pk).update(description_binary=doc.get_update(), description_html=html)
+    page_transaction(new_description_html=html, old_description_html=None, page_id=world.public.id)
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=IMAGE_ID).exists()
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    sent = f' id="{sent_id}"' if sent_id else ""
+    no_celery.reset_mock()
+    response = world.owner.client.patch(url, {
+        "description_html": f'<p>Alpha edited</p><image-component src="{src}"{sent}></image-component>',
+        "expected_updated_at": stamp}, format="json")
+    assert response.status_code == 200, response.content
+    stored = Page.objects.get(pk=world.public.pk)
+    assert ydoc.image_ids(bytes(stored.description_binary)) == [(src, IMAGE_ID)]
+    assert f'id="{IMAGE_ID}"' in stored.description_html and "Alpha edited" in stored.description_html
+    assert not sent_id or sent_id not in stored.description_html
+    for kwargs in [call.kwargs for call in no_celery.call_args_list if "new_description_html" in call.kwargs]:
+        page_transaction(**kwargs)  # the API edit's own indexing
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=IMAGE_ID).exists()
+    # The JSON takes the document's id too; images whose sources disagree are left alone.
+    json_data = {"type": "doc", "content": [{"type": "imageComponent", "attrs": {"src": src}}]}
+    assert with_document_image_ids("<p>x</p>", json_data, bytes(stored.description_binary))[1] == {
+        "type": "doc", "content": [{"type": "imageComponent", "attrs": {"src": src, "id": IMAGE_ID}}]}
+    other = f'<image-component src="0b0b0b0b-0000-4000-8000-0000000000bb" id="{sent_id or "x"}"></image-component>'
+    assert with_document_image_ids(other, None, bytes(stored.description_binary))[0] == other

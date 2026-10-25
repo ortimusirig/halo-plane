@@ -375,7 +375,8 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
                 return Response({"error": "Permission denied"}, status=status.HTTP_403_FORBIDDEN)
             project_ids = list(ProjectPage.objects.filter(page_id=page_id).values_list("project_id", flat=True))
             document = bytes(page.description_binary) if page.description_binary else None
-            behind = bool(document) and text_behind(page_id)
+            # The source's mark passes on as it is (merged too: the copy's document keeps what its HTML lacks).
+            mark = PageTextBehind.objects.filter(page_id=page_id).first() if document else None
             page.pk = None
             page.name = f"{page.name} (Copy)"
             # The document's own title is the source's; the copy's name goes there (or is added), the body stays.
@@ -395,8 +396,8 @@ class HaloPageDuplicateEndpoint(PageDuplicateEndpoint):
                     updated_by_id=page.updated_by_id,
                 )
             PageBeingCopied.objects.create(page_id=page.id, since=timezone.now())
-            if behind:
-                PageTextBehind.objects.create(page_id=page.id, since=timezone.now())
+            if mark is not None:
+                PageTextBehind.objects.create(page_id=page.id, since=timezone.now(), merged=mark.merged)
         _queue(page_transaction, new_description_html=page.description_html, old_description_html=None, page_id=page.id)
         # Plane passes the last project of the loop to its copy task; so does Halo.
         if not _queue(finish_page_copy, page_id=page.id, project_id=project_id, user_id=request.user.id):
