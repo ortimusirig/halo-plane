@@ -88,11 +88,10 @@ Halo. Only then switch the backend services to the image.
      (`halo_page_text_behind`, same transaction) until a save of both: Halo's API then reports
      `text_complete: false` and its edits wait, and the merged save makes no page version and leaves Plane's
      mention index alone (its HTML lacks the API edit's parts; the editor's next, complete save updates both).
-   - Plane's mention index (`PageLog`): every save through Halo's routes queues Halo's index job
-     (`tasks.index_page`) in place of Plane's `page_transaction` diff. Under the page's row lock it brings the
-     index in line with the page's stored text as it is when the job runs, so jobs may run in any order or side
-     by side; the last one sees the latest text. It leaves alone a page whose stored text is a merged save's,
-     and the save that clears that mark queues it again.
+   - Plane's mention index (`PageLog`): every ordinary save keeps Plane's own `page_transaction` with Plane's
+     arguments. Only merged saves differ: they are not indexed and mark the page `merged`, and the complete
+     save that clears that mark queues Halo's `tasks.index_page`, which under the page's row lock brings the
+     index in line with the stored text (and leaves a page merged-marked again alone).
    - Lock, unlock and access run Plane's own code after locking the page's row, so none of them can write
      old text back over an API edit that committed in between. The properties PATCH is a copy of Plane's
      `PageViewSet.partial_update` (same checks, serializer and answers; fingerprinted by the upgrade gate) under

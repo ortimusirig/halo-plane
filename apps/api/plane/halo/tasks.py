@@ -62,12 +62,10 @@ def _indexed_html(page_id) -> str:
 @shared_task
 def index_page(page_id):
     """Plane's mention index (PageLog) brought in line with the page's stored text, both read when the job runs,
-    under the page's row lock. Jobs for one page run one at a time, and each leaves the index matching the text
-    at that moment, so neither their order nor workers running them side by side matter: the last job, run
-    after the last save, sees the latest text. Halo's saves queue this in place of Plane's page_transaction,
-    whose diff of two texts an out-of-order or concurrent job can leave wrong. A page whose stored text is a
-    merged save's (lacking what that editor missed) is left alone; the save that clears that mark queues this
-    job again."""
+    under the page's row lock. Queued only by the complete save that clears a merged mark (views): the merged
+    saves before it were not indexed, so Plane's diff against the stored HTML would not do. Every other save keeps
+    Plane's own page_transaction. A page merged-marked again by the time the job runs is left alone; the save that
+    clears that mark queues the job again."""
     with transaction.atomic():
         page = Page.objects.select_for_update().filter(pk=page_id).only("description_html").first()
         if page is None or PageTextBehind.objects.filter(page_id=page_id, merged=True).exists():
