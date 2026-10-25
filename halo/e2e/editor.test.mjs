@@ -45,11 +45,16 @@ async function api(method, path, body) {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const text = await response.text();
+      if (response.status === 429 && method === "GET" && attempt < 20) {
+        // Plane's API rate limit for a token: a read waits and is sent again.
+        await sleep(3000);
+        continue;
+      }
       return { status: response.status, data: text ? JSON.parse(text) : null };
     } catch (error) {
       // Node's fetch can reuse an idle keep-alive socket the API (uvicorn, 5 s) has just closed; the request never
       // reaches the API. A read is safe to send again; a write is not.
-      if (method !== "GET" || attempt > 1 || error?.cause?.code !== "UND_ERR_SOCKET") throw error;
+      if (method !== "GET" || attempt > 20 || error?.cause?.code !== "UND_ERR_SOCKET") throw error;
     }
   }
 }
