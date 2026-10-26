@@ -6,12 +6,13 @@
 
 import uuid
 
+from bs4 import BeautifulSoup
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
 from plane.bgtasks.copy_s3_object import copy_assets, extract_asset_ids, replace_asset_ids
-from plane.bgtasks.page_transaction_task import extract_all_components, page_transaction
+from plane.bgtasks.page_transaction_task import component_map, get_entity_details, page_transaction
 from plane.bgtasks.page_version_task import track_page_version
 from plane.db.models import Page, PageLog
 from plane.utils.exception_logger import log_exception
@@ -99,25 +100,44 @@ def index_restored_page(self, page_id):
     require an editor to reconnect, so there is no retry limit). Only this restore job takes that path.
     """
     with transaction.atomic():
-        page = Page.objects.select_for_update().filter(pk=page_id).only("description_html").first()
+        page = Page.objects.select_for_update().filter(pk=page_id).only("description_html", "workspace_id").first()
         if page is None:
             return
-        if PageTextBehind.objects.filter(page_id=page_id).exists():
-            raise self.retry(countdown=30)
-        html = page.description_html or ""
-        transaction_ids = set()
-        for entities in extract_all_components(html).values():
-            for entity in entities:
-                try:
-                    transaction_ids.add(uuid.UUID(str(entity.get("id"))))
-                except ValueError:
-                    continue
-        PageLog.all_objects.filter(page_id=page_id, transaction__in=transaction_ids,
-                                   deleted_at__isnull=False).update(deleted_at=None)
-        # Plane's removal query is not page-scoped. Remove here, then use its add-only form so shared IDs
-        # (for example in a duplicate) cannot cause this restore to change another page's index.
-        PageLog.objects.filter(page_id=page_id).exclude(transaction__in=transaction_ids).delete()
-        page_transaction(new_description_html=html, old_description_html=None, page_id=page_id)
+        if not PageTextBehind.objects.filter(page_id=page_id).exists():
+            _reconcile_restored_index(page)
+            return
+    # Release the page lock before publishing the retry to the broker.
+    raise self.retry(countdown=30)
+
+
+def _reconcile_restored_index(page):
+    """Called only under the restore task's page lock; parse completely before changing any index row.
+
+    Plane's extractor hides parser failures as empty text, and page_transaction parses again and hides
+    errors too. Reuse its component map, normalization and add-only insertion here, with errors propagated
+    to the worker instead. This avoids treating a parser failure as permission to remove every reference.
+    """
+    soup = BeautifulSoup(page.description_html or "", "html.parser")
+    rows = []
+    now = timezone.now()
+    for component, config in component_map.items():
+        for tag in soup.find_all(component):
+            entity = {attr: tag.get(attr) for attr in config.get("attributes", ["id"])}
+            if not entity.get("id"):
+                continue  # Plane does not index components without transaction IDs.
+            try:
+                transaction_id = uuid.UUID(str(entity["id"]))
+            except ValueError as error:
+                raise ValueError(f"Page {page.id} has an invalid component transaction ID") from error
+            rows.append(PageLog(transaction=transaction_id, page=page, workspace_id=page.workspace_id,
+                                created_at=now, updated_at=now, **get_entity_details(component, entity)))
+    transaction_ids = {row.transaction for row in rows}
+    if rows:
+        PageLog.objects.bulk_create(rows, batch_size=50, ignore_conflicts=True)
+    PageLog.all_objects.filter(page_id=page.id, transaction__in=transaction_ids,
+                               deleted_at__isnull=False).update(deleted_at=None)
+    # Plane's own removal query is not page-scoped: a restore must not affect another page sharing an ID.
+    PageLog.objects.filter(page_id=page.id).exclude(transaction__in=transaction_ids).delete()
 
 
 @shared_task

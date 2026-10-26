@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Applexus Technologies. Halo changes to Plane Community Edition.
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Restore indexing runs real Plane tasks and PageLog queries, with only the broker/live stubbed."""
+"""Restore indexing runs real tasks and PageLog queries, with external stubs and parser fault injection."""
 
 from unittest.mock import patch
 
@@ -14,6 +14,7 @@ from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page, PageLog
 from plane.halo import ydoc
 from plane.halo.models import PageTextBehind
+from plane.halo.tasks import index_restored_page
 
 pytestmark = pytest.mark.django_db
 
@@ -140,6 +141,8 @@ def test_restore_waits_for_complete_text_then_indexes_current_mentions(
     edit(world, restore_version_id=version)
     delayed = indexing_jobs()
     PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now(), merged=merged)
+    response = world.owner.client.get(f"{world.base}{world.public.id}/").json()
+    assert response["text_complete"] is False
     # HTML still has the restored mention, but is no longer authoritative after a partial editor save.
     with pytest.raises(Retry):
         run_jobs(delayed)
@@ -150,3 +153,58 @@ def test_restore_waits_for_complete_text_then_indexes_current_mentions(
     PageTextBehind.objects.filter(page_id=world.public.id).delete()
     run_jobs(delayed)
     assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION).exists() is kept
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["text_complete"] is True
+
+
+@pytest.mark.parametrize("already_indexed", [False, True])
+def test_restore_indexes_image_components(world, fake_live, indexing_jobs, already_indexed):
+    document = Doc()
+    document.apply_update(bytes(world.public.description_binary))
+    with document.transaction():
+        document.get(ydoc.BODY, type=XmlFragment).children.append(
+            XmlElement("imageComponent", {"id": MENTION, "src": TARGET}))
+    html = f'<p>Before removal</p><image-component id="{MENTION}" src="{TARGET}"></image-component>'
+    Page.objects.filter(pk=world.public.pk).update(description_html=html, description_binary=document.get_update())
+    if already_indexed:
+        page_transaction(new_description_html=html, old_description_html=None, page_id=world.public.id)
+    removed = edit(world, description_html="<p>Image removed</p>", allow_removal=True)
+    run_jobs(indexing_jobs())
+    assert not PageLog.objects.filter(page_id=world.public.id).exists()
+    edit(world, restore_version_id=removed["before_version_id"])
+    jobs = indexing_jobs()
+    run_jobs(jobs)
+    image = PageLog.objects.get(page_id=world.public.id, transaction=MENTION)
+    assert image.entity_name == "image"
+    assert str(image.entity_identifier) == TARGET
+    assert image.workspace_id == world.workspace.id
+    run_jobs(jobs)
+    assert PageLog.objects.filter(page_id=world.public.id).count() == 1
+
+
+def test_restore_parse_failure_preserves_existing_index(world):
+    html = mention_html(MENTION)
+    Page.objects.filter(pk=world.public.pk).update(description_html=html)
+    page_transaction(new_description_html=html, old_description_html=None, page_id=world.public.id)
+    # Fail inside the shared parser dependency, where Plane's extractor swallows the exception.
+    with patch("bs4.BeautifulSoup.find_all", side_effect=RuntimeError("parser failed")):
+        try:
+            index_restored_page(world.public.id)
+        except RuntimeError:
+            pass
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION).exists()
+
+
+def test_restore_invalid_component_id_preserves_index_and_reports_failure(world):
+    page_transaction(new_description_html=mention_html(MENTION), old_description_html=None, page_id=world.public.id)
+    Page.objects.filter(pk=world.public.pk).update(description_html=mention_html("invalid-id"))
+    with pytest.raises(ValueError):
+        index_restored_page(world.public.id)
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION).exists()
+
+
+@pytest.mark.parametrize("html", ["", "<p></p>"])
+def test_restore_valid_empty_text_removes_old_index(world, html):
+    page_transaction(new_description_html=mention_html(MENTION), old_description_html=None, page_id=world.public.id)
+    Page.objects.filter(pk=world.public.pk).update(description_html=html)
+    index_restored_page(world.public.id)
+    assert not PageLog.objects.filter(page_id=world.public.id).exists()

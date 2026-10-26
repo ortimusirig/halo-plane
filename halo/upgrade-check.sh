@@ -191,7 +191,8 @@ mirrored PageDuplicateEndpoint "$UPSTREAM_DUPLICATE_FINGERPRINT" duplicate HaloP
 mirrored PageViewSet "$UPSTREAM_PAGE_FINGERPRINT" "" HaloAppPageViewSet partial_update
 # Plane's mention indexing: Halo keeps Plane's page_transaction for every save that is not merged, runs it
 # add-only (old None) for merged saves and relies on it in tasks.index_page, so the whole task module (its
-# component map decides what is indexed), Plane's web create and every place that calls the task are
+# component map decides what is indexed, and Halo's restore uses that map and get_entity_details directly),
+# Plane's web create and every place that calls the task are
 # fingerprinted (the callers other than create are mirrored by Halo and fingerprinted above).
 index_found=$("$py" halo/index_callers.py module-hash "$work/apps/api/plane/bgtasks/page_transaction_task.py" | tr -d '\r')
 create_found=$(fingerprint app/views/page/base.py PageViewSet | tr ' ' '\n' | grep '^create=' || true)
@@ -201,7 +202,7 @@ if [ "$index_found" = "$UPSTREAM_INDEX_FINGERPRINT" ] && [ "$create_found" = "$U
   echo "OK   Plane's mention indexing (page_transaction) and its callers are unchanged"
 else
   echo "OPEN Plane's mention indexing changed: task ($index_found), create ($create_found), callers ($index_callers);"
-  echo "     check tasks.index_page and the merged-save handling in plane/halo/views.py, then update release.conf"
+  echo "     check tasks.index_page, tasks.index_restored_page and the merged-save handling in plane/halo/views.py, then update release.conf"
   open_items=$((open_items + 1))
 fi
 # The page load is Plane's own PagesDescriptionViewSet.retrieve (fingerprinted above): Halo's subclass may define
