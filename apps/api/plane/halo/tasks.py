@@ -11,7 +11,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from plane.bgtasks.copy_s3_object import copy_assets, extract_asset_ids, replace_asset_ids
-from plane.bgtasks.page_transaction_task import page_transaction
+from plane.bgtasks.page_transaction_task import extract_all_components, page_transaction
 from plane.bgtasks.page_version_task import track_page_version
 from plane.db.models import Page, PageLog
 from plane.utils.exception_logger import log_exception
@@ -87,6 +87,37 @@ def index_page(page_id):
         # Called directly, Plane's task runs here: what is indexed and not in the text goes, anything new comes.
         page_transaction(new_description_html=page.description_html or "",
                          old_description_html=_indexed_html(page_id), page_id=page_id)
+
+
+@shared_task(bind=True, max_retries=None)
+def index_restored_page(self, page_id):
+    """Reconcile an API restore with the current complete text, under the page's row lock.
+
+    Plane's unique (page, transaction) rows survive soft deletion, so an undo needs to reactivate them before
+    indexing. Read the current HTML here rather than the version's: a delayed job must respect subsequent
+    edits. Partial/merged saves make that HTML unreliable; retry until a complete save arrives (which may
+    require an editor to reconnect, so there is no retry limit). Only this restore job takes that path.
+    """
+    with transaction.atomic():
+        page = Page.objects.select_for_update().filter(pk=page_id).only("description_html").first()
+        if page is None:
+            return
+        if PageTextBehind.objects.filter(page_id=page_id).exists():
+            raise self.retry(countdown=30)
+        html = page.description_html or ""
+        transaction_ids = set()
+        for entities in extract_all_components(html).values():
+            for entity in entities:
+                try:
+                    transaction_ids.add(uuid.UUID(str(entity.get("id"))))
+                except ValueError:
+                    continue
+        PageLog.all_objects.filter(page_id=page_id, transaction__in=transaction_ids,
+                                   deleted_at__isnull=False).update(deleted_at=None)
+        # Plane's removal query is not page-scoped. Remove here, then use its add-only form so shared IDs
+        # (for example in a duplicate) cannot cause this restore to change another page's index.
+        PageLog.objects.filter(page_id=page_id).exclude(transaction__in=transaction_ids).delete()
+        page_transaction(new_description_html=html, old_description_html=None, page_id=page_id)
 
 
 @shared_task
