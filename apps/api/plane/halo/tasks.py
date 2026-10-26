@@ -106,19 +106,20 @@ def index_restored_page(self, page_id):
         if not PageTextBehind.objects.filter(page_id=page_id).exists():
             _reconcile_restored_index(page)
             return
-    # Release the page lock before publishing the retry to the broker.
-    raise self.retry(countdown=30)
+    # Release the page lock before publishing the retry. Keep waiting indefinitely, but reduce churn for
+    # an editor that stays offline; cap the exponent too, so a very old job never constructs a huge integer.
+    raise self.retry(countdown=min(30 * 2 ** min(self.request.retries, 4), 300))
 
 
 def _reconcile_restored_index(page):
     """Called only under the restore task's page lock; parse completely before changing any index row.
 
     Plane's extractor hides parser failures as empty text, and page_transaction parses again and hides
-    errors too. Reuse its component map, normalization and add-only insertion here, with errors propagated
+    errors too. Reuse its component map and normalization here, with errors propagated
     to the worker instead. This avoids treating a parser failure as permission to remove every reference.
     """
     soup = BeautifulSoup(page.description_html or "", "html.parser")
-    rows = []
+    rows = {}
     now = timezone.now()
     for component, config in component_map.items():
         for tag in soup.find_all(component):
@@ -129,15 +130,20 @@ def _reconcile_restored_index(page):
                 transaction_id = uuid.UUID(str(entity["id"]))
             except ValueError as error:
                 raise ValueError(f"Page {page.id} has an invalid component transaction ID") from error
-            rows.append(PageLog(transaction=transaction_id, page=page, workspace_id=page.workspace_id,
-                                created_at=now, updated_at=now, **get_entity_details(component, entity)))
-    transaction_ids = {row.transaction for row in rows}
+            if transaction_id not in rows:
+                # Plane's ignore-conflicts insertion keeps the first occurrence in component-map/tag order.
+                # Deduplicate before upsert: PostgreSQL cannot update one conflict row twice in a batch.
+                rows[transaction_id] = PageLog(transaction=transaction_id, page=page, workspace_id=page.workspace_id,
+                                               created_at=now, updated_at=now, **get_entity_details(component, entity))
     if rows:
-        PageLog.objects.bulk_create(rows, batch_size=50, ignore_conflicts=True)
-    PageLog.all_objects.filter(page_id=page.id, transaction__in=transaction_ids,
-                               deleted_at__isnull=False).update(deleted_at=None)
+        # Refresh both active and soft-deleted rows from current HTML, retaining their identity and creation
+        # time. The conflict key includes the page, so shared IDs on other pages remain untouched.
+        PageLog.objects.bulk_create(list(rows.values()), batch_size=50, update_conflicts=True,
+                                    unique_fields=["page", "transaction"],
+                                    update_fields=["entity_name", "entity_type", "entity_identifier", "workspace",
+                                                   "deleted_at", "updated_at"])
     # Plane's own removal query is not page-scoped: a restore must not affect another page sharing an ID.
-    PageLog.objects.filter(page_id=page.id).exclude(transaction__in=transaction_ids).delete()
+    PageLog.objects.filter(page_id=page.id).exclude(transaction__in=rows).delete()
 
 
 @shared_task

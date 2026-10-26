@@ -59,7 +59,9 @@ Halo. Only then switch the backend services to the image.
      image references (`PageLog`). Under the page's row lock it reconciles only that page, using the current
      HTML when the job runs, so a delayed job respects later edits. While a partial or merged editor save
      makes that HTML incomplete (`text_complete: false` on API reads), the job waits and retries until a
-     complete save arrives. Invalid component IDs or parsing failures leave the index unchanged and report
+     complete save arrives (30 seconds initially, backing off to at most five minutes between retries).
+     Existing rows keep their identity and creation time while their reference metadata is refreshed from
+     the current HTML. Invalid component IDs or parsing failures leave the index unchanged and report
      a worker error; valid empty text removes the page's old references. Ordinary edits keep Plane's indexing.
    - Refused for a page that has no editor document yet (made in the web app and not opened since):
      `page_not_ready`, "open it once in Halo". Reads say so beforehand (`text_editable`, with a reason and a

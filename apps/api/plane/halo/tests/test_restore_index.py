@@ -11,7 +11,7 @@ from django.utils import timezone
 from pycrdt import Doc, XmlElement, XmlFragment
 
 from plane.bgtasks.page_transaction_task import page_transaction
-from plane.db.models import Page, PageLog
+from plane.db.models import Page, PageLog, PageVersion
 from plane.halo import ydoc
 from plane.halo.models import PageTextBehind
 from plane.halo.tasks import index_restored_page
@@ -21,6 +21,7 @@ pytestmark = pytest.mark.django_db
 MENTION = "10000000-0000-4000-8000-000000000001"
 LATER = "10000000-0000-4000-8000-000000000002"
 TARGET = "20000000-0000-4000-8000-000000000001"
+NEW_TARGET = "20000000-0000-4000-8000-000000000002"
 
 
 def mention_html(transaction):
@@ -208,3 +209,68 @@ def test_restore_valid_empty_text_removes_old_index(world, html):
     Page.objects.filter(pk=world.public.pk).update(description_html=html)
     index_restored_page(world.public.id)
     assert not PageLog.objects.filter(page_id=world.public.id).exists()
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+@pytest.mark.parametrize("entity_name", ["issue", "user_mention"])
+def test_restore_refreshes_existing_component_metadata(world, indexing_jobs, deleted, entity_name):
+    page_transaction(new_description_html=mention_html(MENTION), old_description_html=None, page_id=world.public.id)
+    original = PageLog.objects.get(page_id=world.public.id, transaction=MENTION)
+    original_id, created_at = original.id, original.created_at
+    if deleted:
+        PageLog.objects.filter(pk=original.id).delete()
+    other = world.make_page(world.owner, "Other page", mention_html(MENTION))
+    page_transaction(new_description_html=mention_html(MENTION), old_description_html=None, page_id=other.id)
+    html = (f'<mention-component id="{MENTION}" entity_name="{entity_name}" '
+            f'entity_identifier="{NEW_TARGET}"></mention-component>')
+    document = Doc()
+    document.apply_update(bytes(world.public.description_binary))
+    with document.transaction():
+        document.get(ydoc.BODY, type=XmlFragment).children.append(
+            XmlElement("mention-component", {"id": MENTION, "entity_name": entity_name,
+                                              "entity_identifier": NEW_TARGET}))
+    version = PageVersion.objects.create(page=world.public, workspace=world.workspace, owned_by=world.owner.user,
+                                         description_html=html, description_binary=document.get_update())
+    edit(world, restore_version_id=str(version.id))
+    run_jobs(indexing_jobs())
+    original.refresh_from_db()
+    assert original.id == original_id and original.created_at == created_at
+    assert original.deleted_at is None
+    assert original.entity_name == entity_name
+    assert str(original.entity_identifier) == NEW_TARGET
+    assert original.entity_type is None
+    assert original.workspace_id == world.workspace.id
+    other_row = PageLog.objects.get(page_id=other.id, transaction=MENTION)
+    assert other_row.entity_name == "issue" and str(other_row.entity_identifier) == TARGET
+    expected = [NEW_TARGET] if entity_name == "issue" else []
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == expected
+
+
+@pytest.mark.parametrize("existing", ["missing", "active", "deleted"])
+def test_restore_duplicate_transaction_ids_use_first_component(world, existing):
+    if existing != "missing":
+        page_transaction(new_description_html=mention_html(MENTION), old_description_html=None, page_id=world.public.id)
+        if existing == "deleted":
+            PageLog.objects.filter(page_id=world.public.id).delete()
+    first = mention_html(MENTION).replace(TARGET, NEW_TARGET)
+    Page.objects.filter(pk=world.public.pk).update(description_html=first + mention_html(MENTION))
+    index_restored_page(world.public.id)
+    rows = PageLog.objects.filter(page_id=world.public.id)
+    assert rows.count() == 1
+    assert str(rows.get().entity_identifier) == NEW_TARGET
+
+
+@pytest.mark.parametrize("retries, countdown", [(0, 30), (1, 60), (3, 240), (4, 300), (100000, 300)])
+def test_restore_retry_backoff_waits_indefinitely_with_capped_delay(world, retries, countdown):
+    PageTextBehind.objects.create(page_id=world.public.id, since=timezone.now(), merged=True)
+    # Eager request context exposes Celery's real retry signature without sending it to a broker.
+    index_restored_page.push_request(args=(), kwargs={"page_id": world.public.id}, retries=retries,
+                                     is_eager=True, called_directly=False)
+    try:
+        with pytest.raises(Retry) as retry:
+            index_restored_page.run(world.public.id)
+    finally:
+        index_restored_page.pop_request()
+    assert retry.value.when == countdown
+    assert retry.value.sig.options["retries"] == retries + 1
+    assert retry.value.sig.kwargs == {"page_id": world.public.id}
