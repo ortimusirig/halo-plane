@@ -405,3 +405,16 @@ def test_a_web_image_does_not_stop_the_reconciliation(world, fake_live, indexing
     assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [NEW_TARGET]
     row = PageLog.objects.get(page_id=world.public.id, transaction=LATER)
     assert row.entity_name == "image" and row.entity_identifier is None  # a web address is not an asset id
+
+
+def test_a_malformed_mention_target_never_reaches_work_item_ids(world, fake_live, indexing_jobs):
+    """Code review of 6fb23fa: a mention whose target is not a UUID is indexed without one, and the API's
+    work_item_ids lists only real work items."""
+    bad = (f'<mention-component id="{LATER}" entity_name="issue" entity_identifier="not-a-uuid">'
+           '</mention-component>')
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      retargeted_mention_html(TARGET))
+    edit(world, description_html=retargeted_mention_html(NEW_TARGET) + bad, allow_removal=True)
+    run_jobs(indexing_jobs())
+    assert PageLog.objects.get(page_id=world.public.id, transaction=LATER).entity_identifier is None
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [NEW_TARGET]

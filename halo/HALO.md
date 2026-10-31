@@ -66,7 +66,8 @@ Halo. Only then switch the backend services to the image.
      Existing rows keep their identity and creation time while their reference metadata is refreshed from
      the current HTML. Invalid component IDs or parsing failures leave the index unchanged and report
      a worker error; valid empty text removes the page's old references. An image from the web (its source is
-     an address, not an asset id) is indexed without an identifier. Plane's `page_transaction` is not used for the
+     an address, not an asset id), or a mention whose target is not an id, is indexed without an identifier;
+     `work_item_ids` lists only real targets. Plane's `page_transaction` is not used for the
      API's edits and restores: it removes entries by transaction id on every page, and a copy keeps its
      source's ids, so an edit of a copy would remove the source's references. Saves in the web app keep
      Plane's indexing.

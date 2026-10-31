@@ -120,7 +120,8 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
         response = super().retrieve(request, slug, project_id, page_id)
         if response.status_code == status.HTTP_200_OK:
             page = Page.objects.get(pk=page_id)
-            response.data["work_item_ids"] = [str(item) for item in response.data.pop("issue_ids", [])]
+            # A mention whose target is not a work item id is indexed without one (tasks._uuid_or_none): not listed.
+            response.data["work_item_ids"] = [str(item) for item in response.data.pop("issue_ids", []) if item]
             response.data.update(
                 {
                     "description_text": page.description_stripped or "",
