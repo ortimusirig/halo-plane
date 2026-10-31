@@ -89,6 +89,30 @@ def test_guest_cannot_create_or_edit(world):
     assert response.status_code == 403
 
 
+def test_edit_names_the_versions_it_pruned(world, fake_live):
+    """Plan review round 20: an API edit at Plane's 20-version limit returns the ids of the versions it removed."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from plane.db.models import PageVersion
+
+    start = timezone.now() - timedelta(days=1)
+    made = [PageVersion.objects.create(page=world.public, workspace=world.public.workspace, owned_by=world.owner.user,
+                                       last_saved_at=start + timedelta(minutes=minute),
+                                       description_html=f"<p>{minute}</p>")
+            for minute in range(20)]
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.member.client.get(url).json()["updated_at"]
+    response = world.member.client.patch(url, {"description_html": "<p>Pruning edit</p>", "expected_updated_at": stamp,
+                                               "allow_removal": True}, format="json")
+    assert response.status_code == 200, response.content
+    assert sorted(response.json()["pruned_version_ids"]) == sorted([str(made[0].id), str(made[1].id)])
+    rename = world.member.client.patch(url, {"name": "Renamed", "expected_updated_at": response.json()["updated_at"]},
+                                       format="json")
+    assert rename.status_code == 200 and rename.json()["pruned_version_ids"] == []
+
+
 def test_edit_returns_versions_and_links(world, fake_live):
     url = f"{world.base}{world.public.id}/"
     stamp = world.member.client.get(url).json()["updated_at"]
@@ -106,6 +130,7 @@ def test_edit_returns_versions_and_links(world, fake_live):
     assert {v["id"] for v in versions} == {data["before_version_id"], data["after_version_id"]}
     before = world.member.client.get(f"{url}versions/{data['before_version_id']}/").json()
     assert before["description_html"] == ORIGINAL
+    assert data["pruned_version_ids"] == []
 
 
 def test_edit_refusals_have_codes(world, fake_live):

@@ -280,7 +280,8 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
                 )
         name_changed = name is not None and name != page.name
         if not (body_changed or name_changed):
-            return {"changed": False, "before_version_id": None, "after_version_id": None, "open_editors_updated": 0}
+            return {"changed": False, "before_version_id": None, "after_version_id": None, "open_editors_updated": 0,
+                    "pruned_version_ids": []}
         if body_changed:
             full_html, full_json = with_document_image_ids(full_html, full_json, document.state)
             page.description_html, page.description_json = full_html, full_json
@@ -292,8 +293,9 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
             _check_size(page.description_html, page.description_binary)
         page.save()
         before = after = None
+        pruned = []
         if body_changed:
-            before, after = versions.record_edit(page, user.id, old)
+            before, after, pruned = versions.record_edit(page, user.id, old)
 
     reached = None
     if update:
@@ -319,5 +321,7 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         "changed": True,
         "before_version_id": str(before.id) if before else None,
         "after_version_id": str(after.id) if after else None,
+        # Plan review round 20: the older versions removed to stay within Plane's 20-version limit, by id.
+        "pruned_version_ids": pruned,
         "open_editors_updated": reached,
     }

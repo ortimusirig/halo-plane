@@ -25,7 +25,7 @@ def test_edit_keeps_old_content_before_and_new_content_after(world):
     old = _old(page)
     page.description_html = "<p>Alpha</p><p>New</p><p>Gamma</p>"
     page.save()
-    before, after = versions.record_edit(page, world.owner.user.id, old)
+    before, after, _ = versions.record_edit(page, world.owner.user.id, old)
     assert before.description_html == "<p>Alpha</p><p>Beta</p><p>Gamma</p>"
     assert after.description_html == page.description_html
     assert before.last_saved_at < after.last_saved_at
@@ -46,7 +46,7 @@ def test_before_is_always_a_new_marked_version(world):
     old = _old(page)
     page.description_html = "<p>Changed</p>"
     page.save()
-    before, after = versions.record_edit(page, world.owner.user.id, old)
+    before, after, _ = versions.record_edit(page, world.owner.user.id, old)
     assert before.id != kept.id and before.sub_pages_data == {"halo_api_edit": True}
     assert PageVersion.objects.filter(page=page).count() == 3
 
@@ -66,7 +66,7 @@ def test_cap_drops_the_oldest_beyond_twenty(world):
     old = _old(page)
     page.description_html = "<p>Changed</p>"
     page.save()
-    before, after = versions.record_edit(page, world.owner.user.id, old)
+    before, after, _ = versions.record_edit(page, world.owner.user.id, old)
     left = PageVersion.objects.filter(page=page)
     assert left.count() == versions.MAX_VERSIONS
     assert {before.id, after.id} <= set(left.values_list("id", flat=True))
@@ -92,3 +92,29 @@ def test_the_cap_needs_no_task_broker(world):
         versions.record_edit(page, world.owner.user.id, old)
     assert PageVersion.objects.filter(page=page).count() == versions.MAX_VERSIONS
     assert PageVersion.all_objects.filter(page=page, deleted_at__isnull=False).count() == 2
+
+
+@pytest.mark.django_db
+def test_pruned_versions_are_reported(world):
+    """Plan review round 20: the 20-version limit is Plane's own, and every version an edit prunes is named."""
+    page = world.public
+    start = timezone.now() - timedelta(days=1)
+    made = [PageVersion.objects.create(page=page, workspace=page.workspace, owned_by=world.owner.user,
+                                       last_saved_at=start + timedelta(minutes=minute),
+                                       description_html=f"<p>{minute}</p>")
+            for minute in range(20)]
+    old = _old(page)
+    page.description_html = "<p>Changed</p>"
+    page.save()
+    _, _, pruned = versions.record_edit(page, world.owner.user.id, old)
+    assert sorted(pruned) == sorted([str(made[0].id), str(made[1].id)])
+
+
+@pytest.mark.django_db
+def test_no_pruning_reports_an_empty_list(world):
+    page = world.public
+    old = _old(page)
+    page.description_html = "<p>Changed</p>"
+    page.save()
+    _, _, pruned = versions.record_edit(page, world.owner.user.id, old)
+    assert pruned == []

@@ -33,7 +33,8 @@ def _version(page, user_id, saved_at, html, binary, json_data):
 
 
 def record_edit(page, user_id, old: dict):
-    """Write the before and after versions of an edit already saved on page."""
+    """Write the before and after versions of an edit already saved on page. Returns before, after and the ids of
+    the older versions removed to stay within Plane's limit of MAX_VERSIONS, so the caller can name them."""
     now = timezone.now()
     # Always a new, marked version: an existing unmarked one could still be rewritten by Plane's version task.
     before = _version(page, user_id, now, old["description_html"], old["description_binary"], old["description_json"])
@@ -53,4 +54,4 @@ def record_edit(page, user_id, old: dict):
     # Plane's soft delete, done in the database alone: an instance delete also queues a task, and a broker failure
     # there would undo the whole edit.
     PageVersion.objects.filter(pk__in=surplus).delete()
-    return before, after
+    return before, after, [str(version_id) for version_id in surplus]

@@ -8,7 +8,7 @@ so in its header. No code from Plane's paid editions is used.
 
 ## Source for Halo users (AGPL section 13)
 
-https://github.com/ortimusirig/halo-plane, one tag per Halo build (this build: `halo-v1.4.2-pages.2`).
+https://github.com/ortimusirig/halo-plane, one tag per Halo build (this build: `halo-v1.4.2-pages.3`).
 The Halo image carries the tag and the commit in its `org.opencontainers.image.version` and
 `org.opencontainers.image.revision` labels. Halo shows the link to the deployed tag on every page
 (Applexus' halo.js) and in AURA's Halo guide; each Halo build gets a new tag and both links move to it.
@@ -153,7 +153,7 @@ copies are skipped and logged.
 ## Build and test
 
 ```bash
-bash halo/build-backend.sh                 # image plane-backend-halo:v1.4.2-pages.2
+bash halo/build-backend.sh                 # image plane-backend-halo:v1.4.2-pages.3
 bash halo/test-backend.sh                  # Halo tests in that image (postgres and valkey in Docker)
 bash halo/test-backend.sh --dev            # the same against the working tree
 bash halo/test-backend.sh --upstream plane/tests   # Plane's own tests on the unpatched image (baseline)
