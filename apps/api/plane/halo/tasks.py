@@ -50,16 +50,6 @@ def _json_with_image_sources(node, sources: dict):
     return node
 
 
-def _indexed_html(page_id) -> str:
-    """The page's entries in Plane's mention index (PageLog), written as the HTML page_transaction reads."""
-    parts = []
-    for transaction_id, entity_name in PageLog.objects.filter(page_id=page_id).values_list("transaction",
-                                                                                         "entity_name"):
-        tag = "image-component" if entity_name == "image" else "mention-component"
-        parts.append(f'<{tag} id="{transaction_id}"></{tag}>')
-    return "".join(parts)
-
-
 @shared_task
 def add_to_index(page_id, html):
     """Plane's page_transaction in the form Plane's create uses (old None: the HTML's entries added, none deleted),
@@ -80,20 +70,21 @@ def index_page(page_id):
     under the page's row lock. Queued only by the complete save that clears a merged mark (views): the saves
     while the page was merged-marked indexed add-only (add_to_index), so the removals they held back, and anything
     a late add_to_index added, are settled here. Every other save keeps Plane's own page_transaction. A page
-    merged-marked again by the time the job runs is left alone; the save that clears that mark queues it again."""
+    merged-marked again by the time the job runs is left alone; the save that clears that mark queues it again.
+    The reconciliation changes only this page's rows: Plane's page_transaction removes entries by transaction id on
+    every page, and a copy keeps its source's transaction ids (code review of e7a0043)."""
     with transaction.atomic():
-        page = Page.objects.select_for_update().filter(pk=page_id).only("description_html").first()
+        page = Page.objects.select_for_update().filter(pk=page_id).only("description_html", "workspace_id").first()
         if page is None or PageTextBehind.objects.filter(page_id=page_id, merged=True).exists():
             return
-        # Called directly, Plane's task runs here: what is indexed and not in the text goes, anything new comes.
-        page_transaction(new_description_html=page.description_html or "",
-                         old_description_html=_indexed_html(page_id), page_id=page_id)
+        _reconcile_restored_index(page)
 
 
 @shared_task(bind=True, max_retries=None)
 def index_restored_page(self, page_id, after_edit=False):
-    """Reconcile an API restore, or an API edit (after_edit, queued after Plane's page_transaction, which leaves a
-    kept mention's or image's old target in place), with the current complete text, under the page's row lock.
+    """Reconcile an API restore, or an API edit (after_edit), with the current complete text, under the page's row
+    lock. It is the API's only index job: it reads the text when it runs, so the order in which jobs finish does
+    not matter, and it changes only this page's rows.
 
     Plane's unique (page, transaction) rows survive soft deletion, so an undo needs to reactivate them before
     indexing. Read the current HTML here rather than the version's: a delayed job must respect subsequent
@@ -113,8 +104,16 @@ def index_restored_page(self, page_id, after_edit=False):
     raise self.retry(countdown=min(30 * 2 ** min(self.request.retries, 4), 300))
 
 
+def _uuid_or_none(value):
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
+
+
 def _reconcile_restored_index(page):
-    """Called only under the restore task's page lock; parse completely before changing any index row.
+    """Called only under the page's row lock (index_restored_page, index_page); parse completely before changing any
+    index row.
 
     Plane's extractor hides parser failures as empty text, and page_transaction parses again and hides
     errors too. Reuse its component map and normalization here, with errors propagated
@@ -135,8 +134,12 @@ def _reconcile_restored_index(page):
             if transaction_id not in rows:
                 # Plane's ignore-conflicts insertion keeps the first occurrence in component-map/tag order.
                 # Deduplicate before upsert: PostgreSQL cannot update one conflict row twice in a batch.
+                details = get_entity_details(component, entity)
+                # An image from the web has its address as src, not an asset id: index it without one rather than
+                # fail the whole page (PageLog.entity_identifier is a UUID field).
+                details["entity_identifier"] = _uuid_or_none(details.get("entity_identifier"))
                 rows[transaction_id] = PageLog(transaction=transaction_id, page=page, workspace_id=page.workspace_id,
-                                               created_at=now, updated_at=now, **get_entity_details(component, entity))
+                                               created_at=now, updated_at=now, **details)
     if rows:
         # Refresh both active and soft-deleted rows from current HTML, retaining their identity and creation
         # time. The conflict key includes the page, so shared IDs on other pages remain untouched.

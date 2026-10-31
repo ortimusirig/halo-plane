@@ -58,14 +58,18 @@ Halo. Only then switch the backend services to the image.
    block ids the browser editor adds. `append_html` adds blocks at the end and deletes nothing.
    - Every edit names the `updated_at` it was made on (`expected_updated_at`, required).
    - One edit of a page at a time (a Redis lease, `plane/halo/lease.py`).
-   - A version restore queues `tasks.index_restored_page` to reactivate the page's soft-deleted mention and
-     image references (`PageLog`). Under the page's row lock it reconciles only that page, using the current
+   - A version restore or an edit queues `tasks.index_restored_page`, the API's only index job, to reactivate
+     the page's soft-deleted mention and image references (`PageLog`) and refresh a kept one's target. Under the page's row lock it reconciles only that page, using the current
      HTML when the job runs, so a delayed job respects later edits. While a partial or merged editor save
      makes that HTML incomplete (`text_complete: false` on API reads), the job waits and retries until a
      complete save arrives (30 seconds initially, backing off to at most five minutes between retries).
      Existing rows keep their identity and creation time while their reference metadata is refreshed from
      the current HTML. Invalid component IDs or parsing failures leave the index unchanged and report
-     a worker error; valid empty text removes the page's old references. Ordinary edits keep Plane's indexing.
+     a worker error; valid empty text removes the page's old references. An image from the web (its source is
+     an address, not an asset id) is indexed without an identifier. Plane's `page_transaction` is not used for the
+     API's edits and restores: it removes entries by transaction id on every page, and a copy keeps its
+     source's ids, so an edit of a copy would remove the source's references. Saves in the web app keep
+     Plane's indexing.
    - Refused for a page that has no editor document yet (made in the web app and not opened since):
      `page_not_ready`, "open it once in Halo". Reads say so beforehand (`text_editable`, with a reason and a
      hint). A page created through the API gets its first document at once (live's converter, the page's name
@@ -106,7 +110,8 @@ Halo. Only then switch the backend services to the image.
      properties PATCH, HTML-only saves) queues Halo's `tasks.add_to_index`: under the page's row lock and only
      while the mark stands, Plane's task in the form its create uses (old `None`: entries added, none
      deleted). The complete save that clears the mark queues Halo's `tasks.index_page`, which under the row
-     lock brings the index in line with the stored text (and leaves a page merged-marked again alone).
+     lock brings that page's index rows (only that page's) in line with the stored text (and leaves a page
+     merged-marked again alone).
    - Lock, unlock and access run Plane's own code after locking the page's row, so none of them can write
      old text back over an API edit that committed in between. The properties PATCH is a copy of Plane's
      `PageViewSet.partial_update` (same checks, serializer and answers; fingerprinted by the upgrade gate) under
@@ -147,7 +152,7 @@ again (any small change). When two separately converted first documents of a pag
 fallback and live at once, on a page nobody opened before), the later save replaces the earlier, as in Plane;
 an API edit made between them is replaced too and stays restorable from its versions.
 Background tasks go through Plane's broker, as in Plane. When it is down, a change made through Halo's routes
-is still saved and answered once; its mentions index (`page_transaction`), version task or a copy's image
+is still saved and answered once; its mentions index job, version task or a copy's image
 copies are skipped and logged.
 
 ## Build and test

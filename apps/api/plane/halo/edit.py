@@ -21,7 +21,6 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page
 from plane.utils.content_validator import validate_binary_data, validate_html_content
 from plane.utils.exception_logger import log_exception
@@ -305,15 +304,14 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
         timer.start()
     if body_changed:
         try:
+            # One page-scoped job brings this page's index in line with its current text (a restore reactivates
+            # the rows Plane soft-deleted, an edit refreshes a kept mention's or image's target). Plane's
+            # page_transaction is not used here: it removes entries by transaction id on every page, so an edit of a
+            # copy would remove its source's entries, and a late diff job could undo a later restore (code review of
+            # e7a0043). Plane's ordinary saves keep Plane's task.
             if restore_from is not None:
                 index_restored_page.delay(page_id=page.id)
             else:
-                page_transaction.delay(
-                    new_description_html=full_html, old_description_html=old["description_html"], page_id=page.id
-                )
-                # page_transaction skips transaction ids already in the old HTML, so an edit that keeps a mention's
-                # or an image's id but changes its target would leave the old target indexed: the page-scoped
-                # reconciliation (the restore job's) refreshes the page's rows from its current text afterwards.
                 index_restored_page.delay(page_id=page.id, after_edit=True)
         except Exception as error:  # the mentions index only; the edit itself is saved
             log_exception(error)

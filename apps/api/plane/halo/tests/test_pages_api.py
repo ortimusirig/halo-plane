@@ -1310,9 +1310,9 @@ def test_a_stale_save_after_another_editor_s_complete_save_keeps_an_api_edit_s_m
         world, fake_live, api_client, no_celery, django_capture_on_commit_callbacks):
     """An API edit adds a mention; editor A saves completely; editor B, stale since before the API edit, saves
     without the mention (merged), then saves completely once it has the missing part. Run in queue order with
-    Plane's real task, the mention's entry is never deleted (a deleted one could not come back)."""
-    from plane.bgtasks.page_transaction_task import page_transaction
+    the real tasks, the mention's entry is never deleted (a deleted one could not come back)."""
     from plane.db.models import PageLog
+    from plane.halo.tasks import index_restored_page
 
     stale = Doc()
     stale.apply_update(bytes(world.public.description_binary))
@@ -1321,10 +1321,11 @@ def test_a_stale_save_after_another_editor_s_complete_save_keeps_an_api_edit_s_m
     no_celery.reset_mock()
     assert world.owner.client.patch(url, {"append_html": f"<p>Delta {_mention(MENTION_ID)}</p>",
                                           "expected_updated_at": stamp}, format="json").status_code == 200
-    edits = [call.kwargs for call in no_celery.call_args_list if "new_description_html" in call.kwargs]
+    edits = [call.kwargs for call in no_celery.call_args_list if call.kwargs.get("after_edit")]
     no_celery.reset_mock()
-    for kwargs in edits:  # the API edit's own page_transaction
-        page_transaction(**kwargs)
+    assert edits == [{"page_id": world.public.id, "after_edit": True}]  # the API edit's only index job
+    for kwargs in edits:
+        index_restored_page(**kwargs)
     assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION_ID).exists()
     stored = Page.objects.get(pk=world.public.pk)
     current = Doc()

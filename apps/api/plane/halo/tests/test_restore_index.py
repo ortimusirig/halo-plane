@@ -14,7 +14,7 @@ from plane.bgtasks.page_transaction_task import page_transaction
 from plane.db.models import Page, PageLog, PageVersion
 from plane.halo import ydoc
 from plane.halo.models import PageTextBehind
-from plane.halo.tasks import index_restored_page
+from plane.halo.tasks import index_page, index_restored_page
 
 pytestmark = pytest.mark.django_db
 
@@ -278,7 +278,7 @@ def test_restore_retry_backoff_waits_indefinitely_with_capped_delay(world, retri
 
 # ---- API edits that keep a component's id but change its target (code review 2026-10-31, P2 #1) -------------
 # Plane's page_transaction skips transaction ids already in the old HTML, so without a refresh the index kept the
-# old target. The edit now also queues the page-scoped reconciliation; Plane's own call stays.
+# old target. The edit's only index job is the page-scoped reconciliation, which refreshes it.
 
 def indexed_component(world, element, attrs, html):
     document = Doc()
@@ -294,16 +294,12 @@ def retargeted_mention_html(target):
             f'entity_identifier="{target}"></mention-component>')
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_api_edit_that_retargets_a_kept_mention_refreshes_the_index(world, fake_live, indexing_jobs, reverse):
+def test_api_edit_that_retargets_a_kept_mention_refreshes_the_index(world, fake_live, indexing_jobs):
     indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
                       retargeted_mention_html(TARGET))
     assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [TARGET]
     edit(world, description_html=retargeted_mention_html(NEW_TARGET), allow_removal=True)
-    jobs = indexing_jobs()
-    names = [task.name for task, _, _ in jobs]
-    assert page_transaction.name in names and index_restored_page.name in names  # Plane's call is kept
-    run_jobs(list(reversed(jobs)) if reverse else jobs)  # either order the worker may run them in
+    run_jobs(indexing_jobs())
     assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [NEW_TARGET]
     assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION).count() == 1
 
@@ -324,3 +320,88 @@ def test_api_edit_refresh_is_told_apart_from_a_restore(world, fake_live, indexin
     edit(world, description_html=retargeted_mention_html(NEW_TARGET), allow_removal=True)
     refresh = [kwargs for task, _, kwargs in indexing_jobs() if task.name == index_restored_page.name]
     assert refresh == [{"page_id": world.public.id, "after_edit": True}]
+
+
+# Code review of e7a0043: Plane's page_transaction removes entries by transaction id on every page, and a copy keeps
+# its source's transaction ids. Halo's own index jobs (the merged-mark clearing and the API's edits and restores)
+# reconcile only the page itself; Plane's ordinary saves keep Plane's task.
+
+def shared_mention(world):
+    """The public page and a copy of it both carry MENTION, both indexed (as after Plane's duplicate)."""
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      "<p>Source</p>" + mention_html(MENTION))
+    copy = world.make_page(world.owner, "Copy", "<p>Copy</p>" + mention_html(MENTION))
+    page_transaction(new_description_html=copy.description_html, old_description_html=None, page_id=copy.id)
+    assert PageLog.objects.filter(page_id=copy.id, transaction=MENTION).exists()
+    return copy
+
+
+def test_index_page_never_changes_another_pages_rows(world, fake_live):
+    copy = world.make_page(world.owner, "Copy", "<p>Copy</p>" + mention_html(MENTION))
+    page_transaction(new_description_html=copy.description_html, old_description_html=None, page_id=copy.id)
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      "<p>Source</p>" + mention_html(MENTION))
+    # The copy's complete save that clears its merged mark no longer has the mention; Halo's job reconciles it.
+    Page.objects.filter(pk=copy.pk).update(description_html="<p>Copy without it</p>")
+    index_page(page_id=copy.id)
+    assert not PageLog.objects.filter(page_id=copy.id, transaction=MENTION).exists()
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION).exists()
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [TARGET]
+
+
+def test_api_edit_of_another_page_never_changes_this_pages_rows(world, fake_live, indexing_jobs):
+    copy = shared_mention(world)
+    url = f"{world.base}{copy.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(url, {"description_html": "<p>Copy without it</p>", "allow_removal": True,
+                                              "expected_updated_at": stamp}, format="json")
+    assert response.status_code == 200, response.content
+    run_jobs(indexing_jobs())
+    assert not PageLog.objects.filter(page_id=copy.id, transaction=MENTION).exists()
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [TARGET]
+
+
+def test_a_late_index_job_never_removes_a_restored_mention(world, fake_live, indexing_jobs):
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      "<p>Before removal</p>" + mention_html(MENTION))
+    removal = edit(world, description_html="<p>Removed</p>", allow_removal=True)
+    removal_jobs = indexing_jobs()
+    edit(world, restore_version_id=removal["before_version_id"])
+    restore_jobs = indexing_jobs()
+    # Several workers may finish jobs in any order: here every reconciliation first, any other index job last.
+    jobs = removal_jobs + restore_jobs
+    run_jobs([job for job in jobs if job[0].name == index_restored_page.name]
+             + [job for job in jobs if job[0].name != index_restored_page.name])
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [TARGET]
+
+
+def test_api_edit_queues_only_the_page_scoped_reconciliation(world, fake_live, indexing_jobs):
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      retargeted_mention_html(TARGET))
+    edit(world, description_html=retargeted_mention_html(NEW_TARGET), allow_removal=True)
+    jobs = indexing_jobs()
+    assert [(task.name, kwargs) for task, _, kwargs in jobs] == [
+        (index_restored_page.name, {"page_id": world.public.id, "after_edit": True})]
+
+
+WEB_IMAGE = "https://example.com/logo.png"
+
+
+def test_a_web_image_does_not_stop_the_reconciliation(world, fake_live, indexing_jobs):
+    image = f'<image-component id="{LATER}" src="{WEB_IMAGE}"></image-component>'
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      retargeted_mention_html(TARGET))
+    # The image from the web is added after the mention was indexed (Plane's own task cannot index it: its source is
+    # not an asset id, so Plane's insert fails and is only logged).
+    document = Doc()
+    document.apply_update(bytes(Page.objects.get(pk=world.public.pk).description_binary))
+    with document.transaction():
+        document.get(ydoc.BODY, type=XmlFragment).children.append(
+            XmlElement("imageComponent", {"id": LATER, "src": WEB_IMAGE}))
+    Page.objects.filter(pk=world.public.pk).update(description_html=retargeted_mention_html(TARGET) + image,
+                                                   description_binary=document.get_update())
+    edit(world, description_html=retargeted_mention_html(NEW_TARGET) + image, allow_removal=True)
+    run_jobs(indexing_jobs())
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [NEW_TARGET]
+    row = PageLog.objects.get(page_id=world.public.id, transaction=LATER)
+    assert row.entity_name == "image" and row.entity_identifier is None  # a web address is not an asset id
