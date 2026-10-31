@@ -203,9 +203,11 @@ def _align(old: list, new: list) -> list[tuple[int, int]]:
         if not _same_kind(old[i], new[j]):
             return None
         union = old_words[i] | new_words[j]
-        return 1.0 + (len(old_words[i] & new_words[j]) / len(union) if union else 1.0)
+        return 1.0 + share * (len(old_words[i] & new_words[j]) / len(union) if union else 1.0)
 
     rows, cols = len(old), len(new)
+    # Words in common, summed over every pair, weigh less than one pair, so the most pairs win first.
+    share = 1.0 / (min(rows, cols) + 1)
     best = [[0.0] * (cols + 1) for _ in range(rows + 1)]
     for i in range(rows - 1, -1, -1):
         for j in range(cols - 1, -1, -1):

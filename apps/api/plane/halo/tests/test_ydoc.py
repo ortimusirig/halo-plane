@@ -199,6 +199,16 @@ def test_same_type_blocks_in_one_changed_range_are_paired_in_order():
     assert merged == ('<heading level="1">Zero</heading><paragraph>Typed One, edited</paragraph>'
                       "<paragraph>Three, edited</paragraph>")
 
+
+def test_the_most_blocks_are_kept_before_words_in_common_count():
+    # Pages design review 7 (2026-10-31, P1): words in common outweighed a third pair, so "Summary" was deleted
+    # although all three paragraphs could be edited in place, and typing made in it without the edit was lost.
+    old = page(p("Summary"), p("red green blue"), p("one two three"))
+    new = page(p("Summary red green blue"), p("one two three four"), p("Closing"))
+    merged = _merge_offline(old, new, 0, "Typed ", at_start=True)
+    assert merged == ("<paragraph>Typed Summary red green blue</paragraph><paragraph>one two three four</paragraph>"
+                      "<paragraph>Closing</paragraph>")
+
 def test_attribute_and_formatting_changes_keep_the_element():
     old = page(("heading", {"level": 2.0, "id": "h1"}, [("Plan", None)]), p("plain words"))
     new = page(("heading", {"level": 3.0}, [("Plan", None)]), p("plain words", {"bold": {}}))

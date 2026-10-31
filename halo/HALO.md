@@ -148,8 +148,8 @@ Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with two tables
 Known limits: typing on an open page can be lost where an API edit removed the block it was typed into,
 changed that block's type (for example a paragraph made a heading) or rewrote the same characters, when the
 editor did not have the edit first: live missed the half-second open-page probe, or the editor was offline.
-Inside a changed stretch, blocks of the same type are paired in order (the ones with the most words in common)
-and edited in place, so typing in them is kept. On a long page, an edit whose changes are far apart (more than
+Inside a changed stretch, blocks of the same type are paired in order (as many as possible, and among those
+the ones with the most words in common) and edited in place, so typing in them is kept. On a long page, an edit whose changes are far apart (more than
 `DIFF_LIMIT` block pairs between them, about 500 blocks each way) pairs the blocks in between by position
 instead, so untouched blocks there can be replaced too; the same change made as separate edits keeps them.
 The edit's before and after versions hold only what Halo saw, so typing that never reached Halo cannot be
