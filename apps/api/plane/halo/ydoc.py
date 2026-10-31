@@ -15,6 +15,7 @@ live's converter never produces.
 import difflib
 import itertools
 import json
+import re
 from collections import Counter
 from typing import NamedTuple
 
@@ -185,26 +186,90 @@ def _same_kind(node, new) -> bool:
     return node.tag == new.tag
 
 
+def _plain(node) -> str:
+    if isinstance(node, XmlText):
+        return "".join(chunk for chunk, _ in node.diff() if isinstance(chunk, str))
+    return " ".join(_plain(child) for child in node.children)
+
+
+def _align(old: list, new: list) -> list[tuple[int, int]]:
+    """Pairs (old index, new index), in order on both sides, of same-type nodes in one changed range: the pairing
+    with the most pairs, and among those the most words in common, so that a node is edited in place rather than
+    replaced (an editor's unsent typing in it then survives the merge)."""
+    old_words = [frozenset(re.findall(r"\w+", _plain(n).lower())) for n in old]
+    new_words = [frozenset(re.findall(r"\w+", _plain(n).lower())) for n in new]
+
+    def weight(i, j):
+        if not _same_kind(old[i], new[j]):
+            return None
+        union = old_words[i] | new_words[j]
+        return 1.0 + (len(old_words[i] & new_words[j]) / len(union) if union else 1.0)
+
+    rows, cols = len(old), len(new)
+    best = [[0.0] * (cols + 1) for _ in range(rows + 1)]
+    for i in range(rows - 1, -1, -1):
+        for j in range(cols - 1, -1, -1):
+            score = max(best[i + 1][j], best[i][j + 1])
+            w = weight(i, j)
+            if w is not None:
+                score = max(score, w + best[i + 1][j + 1])
+            best[i][j] = score
+    pairs, i, j = [], 0, 0
+    while i < rows and j < cols:
+        w = weight(i, j)
+        if w is not None and best[i][j] == w + best[i + 1][j + 1]:
+            pairs.append((i, j))
+            i, j = i + 1, j + 1
+        elif best[i][j] == best[i + 1][j]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def _patch_pair(node, replacement) -> None:
+    if isinstance(node, XmlText):
+        _patch_text(node, replacement)
+    else:
+        _patch_element(node, replacement)
+
+
+def _patch_range(parent, start: int, old: list, new: list) -> None:
+    """Lay `new` over parent.children[start : start + len(old)], which hold `old`."""
+    if len(old) * len(new) > DIFF_LIMIT:
+        # Too large to compare: pair the nodes by position (HALO.md, Known limits).
+        paired = min(len(old), len(new))
+        for index in range(start + len(old) - 1, start + paired - 1, -1):
+            del parent.children[index]
+        for offset, node in enumerate(new[paired:]):
+            _insert_node(parent, start + paired + offset, node)
+        for offset in range(paired):
+            index, node, replacement = start + offset, old[offset], new[offset]
+            if not _same_kind(node, replacement):
+                del parent.children[index]
+                _insert_node(parent, index, replacement)
+            else:
+                _patch_pair(node, replacement)
+        return
+    # Same-type nodes are paired and edited in place; the others are removed or added. From the end backwards,
+    # so the indexes of earlier nodes stay valid.
+    bounds = [(-1, -1), *_align(old, new), (len(old), len(new))]
+    for (old_before, new_before), (old_at, new_at) in reversed(list(zip(bounds, bounds[1:]))):
+        if old_at < len(old):
+            _patch_pair(old[old_at], new[new_at])
+        for index in range(start + old_at - 1, start + old_before, -1):
+            del parent.children[index]
+        for offset, node in enumerate(new[new_before + 1 : new_at]):
+            _insert_node(parent, start + old_before + 1 + offset, node)
+
+
 def _patch_children(parent, new_parent) -> bool:
     """Lay new_parent's children over parent's: keep equal nodes, edit paired nodes in place, add the rest."""
     old, new = list(parent.children), list(new_parent.children)
     changes = _changes([_signature(n) for n in old], [_signature(n) for n in new])
     # From the end backwards, so the indexes of earlier nodes stay valid.
     for old_start, old_end, new_start, new_end in reversed(changes):
-        paired = min(old_end - old_start, new_end - new_start)
-        for index in range(old_end - 1, old_start + paired - 1, -1):
-            del parent.children[index]
-        for offset, node in enumerate(new[new_start + paired : new_end]):
-            _insert_node(parent, old_start + paired + offset, node)
-        for offset in range(paired):
-            index, node, replacement = old_start + offset, old[old_start + offset], new[new_start + offset]
-            if not _same_kind(node, replacement):
-                del parent.children[index]
-                _insert_node(parent, index, replacement)
-            elif isinstance(node, XmlText):
-                _patch_text(node, replacement)
-            else:
-                _patch_element(node, replacement)
+        _patch_range(parent, old_start, old[old_start:old_end], new[new_start:new_end])
     return bool(changes)
 
 

@@ -159,6 +159,46 @@ def test_offline_typing_in_the_edited_paragraph_survives():
     )
 
 
+
+def _merge_offline(old, new, block, typed, at_start=False):
+    """An API edit old -> new, and a copy with old's history that typed into block `block` without the edit."""
+    client = Doc()
+    client.apply_update(old)
+    before = client.get_state()
+    text = client.get(ydoc.BODY, type=XmlFragment).children[block].children[0]
+    text.insert(0 if at_start else len(text), typed)
+    offline = client.get_update(before)
+    edit = ydoc.edit_document(old, new_body=new)
+    server = Doc()
+    server.apply_update(edit.state)
+    server.apply_update(offline)
+    client.apply_update(edit.update)
+    assert str(server.get(ydoc.BODY, type=XmlFragment)) == str(client.get(ydoc.BODY, type=XmlFragment))
+    return str(server.get(ydoc.BODY, type=XmlFragment))
+
+
+def test_a_block_inserted_above_an_edited_paragraph_keeps_its_offline_typing():
+    # Halo code review 2026-10-31 (P1): in one changed range, blocks were paired by position, so the paragraph was
+    # paired with the new heading, deleted and written again, and typing made in it without the edit was lost.
+    merged = _merge_offline(page(p("Alpha")), page(("heading", {"level": 2.0}, [("Title", None)]), p("Alpha edited")),
+                            0, "Typed ", at_start=True)
+    assert merged == '<heading level="2">Title</heading><paragraph>Typed Alpha edited</paragraph>'
+
+
+def test_a_block_removed_beside_an_edited_paragraph_keeps_its_offline_typing():
+    old = page(("heading", {"level": 2.0}, [("Title", None)]), p("Alpha"))
+    merged = _merge_offline(old, page(p("Alpha edited")), 1, "Typed ", at_start=True)
+    assert merged == "<paragraph>Typed Alpha edited</paragraph>"
+
+
+def test_same_type_blocks_in_one_changed_range_are_paired_in_order():
+    old = page(p("One"), ("heading", {"level": 2.0}, [("Two", None)]), p("Three"))
+    new = page(("heading", {"level": 1.0}, [("Zero", None)]), p("One, edited"), p("Three, edited"))
+    # By position, "One" would meet the new heading; paired by type and words it meets "One, edited".
+    merged = _merge_offline(old, new, 0, "Typed ", at_start=True)
+    assert merged == ('<heading level="1">Zero</heading><paragraph>Typed One, edited</paragraph>'
+                      "<paragraph>Three, edited</paragraph>")
+
 def test_attribute_and_formatting_changes_keep_the_element():
     old = page(("heading", {"level": 2.0, "id": "h1"}, [("Plan", None)]), p("plain words"))
     new = page(("heading", {"level": 3.0}, [("Plan", None)]), p("plain words", {"bold": {}}))
