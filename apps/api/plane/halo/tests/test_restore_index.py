@@ -418,3 +418,32 @@ def test_a_malformed_mention_target_never_reaches_work_item_ids(world, fake_live
     run_jobs(indexing_jobs())
     assert PageLog.objects.get(page_id=world.public.id, transaction=LATER).entity_identifier is None
     assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [NEW_TARGET]
+
+
+def test_a_late_create_index_job_never_brings_back_a_removed_mention(world, fake_live, indexing_jobs):
+    """Code review of 4231b9c: the API create's index job reads the page's text when it runs, so a create job that
+    finishes after a later edit's job cannot index a mention the edit removed."""
+    response = world.owner.client.post(world.base, {"name": "Made by the API",
+                                                    "description_html": "<p>New</p>" + mention_html(MENTION)},
+                                       format="json")
+    assert response.status_code == 201, response.content
+    url = f"{world.base}{response.json()['id']}/"
+    create_jobs = indexing_jobs()
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    removal = world.owner.client.patch(url, {"description_html": "<p>Without it</p>", "allow_removal": True,
+                                             "expected_updated_at": stamp}, format="json")
+    assert removal.status_code == 200, removal.content
+    run_jobs(indexing_jobs())  # the edit's job first
+    run_jobs(create_jobs)  # the create's job last
+    assert world.owner.client.get(url).json()["work_item_ids"] == []
+
+
+def test_a_rename_under_a_search_filter_answers_with_the_renamed_page(world, fake_live, indexing_jobs):
+    """Code review of 4231b9c: ?search narrows the list only; a change by id answers with the changed page."""
+    url = f"{world.base}{world.public.id}/"
+    stamp = world.owner.client.get(url).json()["updated_at"]
+    response = world.owner.client.patch(f"{url}?search=Plan", {"name": "Renamed", "expected_updated_at": stamp},
+                                        format="json")
+    assert response.status_code == 200, response.content
+    assert response.json()["name"] == "Renamed"
+    assert Page.objects.get(pk=world.public.pk).name == "Renamed"

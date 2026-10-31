@@ -82,8 +82,8 @@ def index_page(page_id):
 
 @shared_task(bind=True, max_retries=None)
 def index_restored_page(self, page_id, after_edit=False):
-    """Reconcile an API restore, or an API edit (after_edit), with the current complete text, under the page's row
-    lock. It is the API's only index job: it reads the text when it runs, so the order in which jobs finish does
+    """Reconcile an API restore, or an API create or edit (after_edit), with the current complete text, under the
+    page's row lock. It is the API's only index job: it reads the text when it runs, so the order in which jobs finish does
     not matter, and it changes only this page's rows.
 
     Plane's unique (page, transaction) rows survive soft deletion, so an undo needs to reactivate them before

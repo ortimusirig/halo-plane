@@ -761,8 +761,8 @@ def test_a_save_of_html_alone_marks_the_text_as_behind(world, api_client):
 
 def test_create_answers_201_once_although_the_broker_is_down(world):
     pages = Page.objects.count()
-    with patch("plane.halo.views.page_transaction") as page_transaction:
-        page_transaction.delay.side_effect = RuntimeError("broker down")
+    with patch("plane.halo.views.index_restored_page") as index_job:
+        index_job.delay.side_effect = RuntimeError("broker down")
         response = world.owner.client.post(world.base, {"name": "New"}, format="json")
     assert response.status_code == 201, response.content
     assert Page.objects.count() == pages + 1

@@ -38,7 +38,7 @@ from plane.utils.exception_logger import log_exception
 from . import live, ydoc
 from .edit import EditRefused, edit_page, first_document, sanitize, text_behind
 from .models import PageBeingCopied, PageTextBehind
-from .tasks import add_to_index, finish_page_copy, index_page, track_page_version_after_save
+from .tasks import add_to_index, finish_page_copy, index_page, index_restored_page, track_page_version_after_save
 
 EDIT_FIELDS = {"name", "description_html", "append_html", "restore_version_id", "expected_updated_at", "allow_removal"}
 # Plane's PageSerializer would also take parent (any page id), is_locked and archived_at; the API does not.
@@ -103,6 +103,13 @@ class PersonalTokenMixin:
 
 
 class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
+    def filter_queryset(self, queryset):
+        # ?search and the other list filters narrow the list only: a page read or changed by its id is found whatever
+        # its name, so a rename under ?search=<old name> answers with the renamed page (code review of 4231b9c).
+        if self.action == "list":
+            return super().filter_queryset(queryset)
+        return queryset
+
     def list(self, request, slug, project_id):
         queryset = self.get_queryset()
         if _guest_limited(request, slug, project_id):
@@ -182,7 +189,9 @@ class HaloProjectPageViewSet(PersonalTokenMixin, PageViewSet):
             # The page and its project link (PageSerializer.create) commit together, and only with the answer.
             serializer.save()
             data = PageDetailSerializer(self.get_queryset().get(pk=serializer.data["id"])).data
-        _queue(page_transaction, new_description_html=html, old_description_html=None, page_id=data["id"])
+        # The page-scoped job that reads the page's text when it runs, as for the API's edits: a create job finishing
+        # after a later edit's job cannot index what that edit removed (code review of 4231b9c).
+        _queue(index_restored_page, page_id=data["id"], after_edit=True)
         data["url"] = page_url(slug, project_id, data["id"])
         data.update(_editability(reason is None, reason))
         return Response(data, status=status.HTTP_201_CREATED)

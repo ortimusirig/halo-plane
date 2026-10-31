@@ -58,7 +58,7 @@ Halo. Only then switch the backend services to the image.
    block ids the browser editor adds. `append_html` adds blocks at the end and deletes nothing.
    - Every edit names the `updated_at` it was made on (`expected_updated_at`, required).
    - One edit of a page at a time (a Redis lease, `plane/halo/lease.py`).
-   - A version restore or an edit queues `tasks.index_restored_page`, the API's only index job, to reactivate
+   - A version restore, an edit or a create queues `tasks.index_restored_page`, the API's only index job, to reactivate
      the page's soft-deleted mention and image references (`PageLog`) and refresh a kept one's target. Under the page's row lock it reconciles only that page, using the current
      HTML when the job runs, so a delayed job respects later edits. While a partial or merged editor save
      makes that HTML incomplete (`text_complete: false` on API reads), the job waits and retries until a
@@ -68,7 +68,7 @@ Halo. Only then switch the backend services to the image.
      a worker error; valid empty text removes the page's old references. An image from the web (its source is
      an address, not an asset id), or a mention whose target is not an id, is indexed without an identifier;
      `work_item_ids` lists only real targets. Plane's `page_transaction` is not used for the
-     API's edits and restores: it removes entries by transaction id on every page, and a copy keeps its
+     API's creates, edits and restores: it removes entries by transaction id on every page, and a copy keeps its
      source's ids, so an edit of a copy would remove the source's references. Saves in the web app keep
      Plane's indexing.
    - Refused for a page that has no editor document yet (made in the web app and not opened since):
