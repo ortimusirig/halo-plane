@@ -8,7 +8,7 @@ so in its header. No code from Plane's paid editions is used.
 
 ## Source for Halo users (AGPL section 13)
 
-https://github.com/ortimusirig/halo-plane, one tag per Halo build (this build: `halo-v1.4.2-pages.3`).
+https://github.com/ortimusirig/halo-plane, one tag per Halo build (this build: `halo-v1.4.2-pages.4`).
 The Halo image carries the tag and the commit in its `org.opencontainers.image.version` and
 `org.opencontainers.image.revision` labels. Halo shows the link to the deployed tag on every page
 (Applexus' halo.js) and in AURA's Halo guide; each Halo build gets a new tag and both links move to it.
@@ -145,8 +145,15 @@ Files: `apps/api/plane/halo/` (new, a Django app labelled `halo` with two tables
 `apps/api/plane/urls.py` (includes), `apps/api/plane/bgtasks/page_version_task.py` (fix and marked versions),
 `apps/api/requirements/base.txt` (`pycrdt==0.14.8`), and this `halo/` folder (build, tests, upgrade gate).
 
-Known limits: typing on an open page can be lost only where an API edit rewrote the same characters while
-live missed the half-second open-page probe. Pages over 100 kB of HTML (live's converter limit) cannot be
+Known limits: typing on an open page can be lost where an API edit removed the block it was typed into,
+changed that block's type (for example a paragraph made a heading) or rewrote the same characters, when the
+editor did not have the edit first: live missed the half-second open-page probe, or the editor was offline.
+Inside a changed stretch, blocks of the same type are paired in order (the ones with the most words in common)
+and edited in place, so typing in them is kept. On a long page, an edit whose changes are far apart (more than
+`DIFF_LIMIT` block pairs between them, about 500 blocks each way) pairs the blocks in between by position
+instead, so untouched blocks there can be replaced too; the same change made as separate edits keeps them.
+The edit's before and after versions hold only what Halo saw, so typing that never reached Halo cannot be
+restored from them. Pages over 100 kB of HTML (live's converter limit) cannot be
 edited through the API. A page made in the web app and not opened since cannot be edited through the API until
 someone opens it once (live builds its document then). A marked page stays marked until an editor saves it
 again (any small change). When two separately converted first documents of a page meet (the browser's offline
@@ -159,7 +166,7 @@ copies are skipped and logged.
 ## Build and test
 
 ```bash
-bash halo/build-backend.sh                 # image plane-backend-halo:v1.4.2-pages.3
+bash halo/build-backend.sh                 # image plane-backend-halo:v1.4.2-pages.4
 bash halo/test-backend.sh                  # Halo tests in that image (postgres and valkey in Docker)
 bash halo/test-backend.sh --dev            # the same against the working tree
 bash halo/test-backend.sh --upstream plane/tests   # Plane's own tests on the unpatched image (baseline)

@@ -21,7 +21,7 @@ x-app-env: &app-env
   AWS_S3_BUCKET_NAME: uploads
 
 x-backend: &backend
-  image: ${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.3}
+  image: ${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.4}
   environment: *app-env
 
 services:
