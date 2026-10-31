@@ -91,13 +91,15 @@ def index_page(page_id):
 
 
 @shared_task(bind=True, max_retries=None)
-def index_restored_page(self, page_id):
-    """Reconcile an API restore with the current complete text, under the page's row lock.
+def index_restored_page(self, page_id, after_edit=False):
+    """Reconcile an API restore, or an API edit (after_edit, queued after Plane's page_transaction, which leaves a
+    kept mention's or image's old target in place), with the current complete text, under the page's row lock.
 
     Plane's unique (page, transaction) rows survive soft deletion, so an undo needs to reactivate them before
     indexing. Read the current HTML here rather than the version's: a delayed job must respect subsequent
     edits. Partial/merged saves make that HTML unreliable; retry until a complete save arrives (which may
-    require an editor to reconnect, so there is no retry limit). Only this restore job takes that path.
+    require an editor to reconnect, so there is no retry limit). Only this job (API restores and API edits) takes
+    that path.
     """
     with transaction.atomic():
         page = Page.objects.select_for_update().filter(pk=page_id).only("description_html", "workspace_id").first()

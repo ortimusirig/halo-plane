@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --no-deps --require-hashes -r /tmp/requirements-h
     && python -c "import pycrdt" && test -f /code/plane/halo/edit.py \
     && grep -q "description_json=page.description_json" /code/plane/bgtasks/page_version_task.py
 ARG HALO_REVISION=unknown
-ARG HALO_TAG=halo-v1.4.2-pages.1
+ARG HALO_TAG=halo-v1.4.2-pages.2
 LABEL org.opencontainers.image.source="https://github.com/ortimusirig/halo-plane" \
       org.opencontainers.image.revision="${HALO_REVISION}" \
       org.opencontainers.image.version="${HALO_TAG}" \

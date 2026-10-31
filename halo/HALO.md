@@ -8,7 +8,7 @@ so in its header. No code from Plane's paid editions is used.
 
 ## Source for Halo users (AGPL section 13)
 
-https://github.com/ortimusirig/halo-plane, one tag per Halo build (this build: `halo-v1.4.2-pages.1`).
+https://github.com/ortimusirig/halo-plane, one tag per Halo build (this build: `halo-v1.4.2-pages.2`).
 The Halo image carries the tag and the commit in its `org.opencontainers.image.version` and
 `org.opencontainers.image.revision` labels. Halo shows the link to the deployed tag on every page
 (Applexus' halo.js) and in AURA's Halo guide; each Halo build gets a new tag and both links move to it.
@@ -23,11 +23,14 @@ download:
   with the Python packages pinned in `apps/api/requirements/` (Plane's choice, unchanged by Halo).
 - pycrdt 0.14.8 (MIT), the one library Halo adds: source distribution `pycrdt-0.14.8.tar.gz`, sha256
   `45867f5ff08006d852d0cbb3e26b581977122b8f77dcd300359a16188b6cc931`, from PyPI and attached to the GitHub
-  release of each tag; its Rust crates are pinned by the `Cargo.lock` inside it. Upstream:
+  release `halo-v1.4.2-pages.1`
+  (https://github.com/ortimusirig/halo-plane/releases/download/halo-v1.4.2-pages.1/pycrdt-0.14.8.tar.gz); that
+  one file serves every later tag that pins pycrdt 0.14.8, and a tag that changes the pin attaches the new
+  version to its own release. Its Rust crates are pinned by the `Cargo.lock` inside it. Upstream:
   https://github.com/y-crdt/pycrdt.
 
-Release checklist (before the patched image serves anyone): push the branch and tag; attach the pycrdt
-source distribution to the tag's release; download the tag zip and the attachment while signed out; check
+Release checklist (before the patched image serves anyone): push the branch and tag; make sure the pycrdt
+source distribution of the pinned version is attached to a release (see above); download the tag zip and the attachment while signed out; check
 that the image's revision label is the tag's commit; install the halo.js link to that tag and see it in
 Halo. Only then switch the backend services to the image.
 
@@ -150,7 +153,7 @@ copies are skipped and logged.
 ## Build and test
 
 ```bash
-bash halo/build-backend.sh                 # image plane-backend-halo:v1.4.2-pages.1
+bash halo/build-backend.sh                 # image plane-backend-halo:v1.4.2-pages.2
 bash halo/test-backend.sh                  # Halo tests in that image (postgres and valkey in Docker)
 bash halo/test-backend.sh --dev            # the same against the working tree
 bash halo/test-backend.sh --upstream plane/tests   # Plane's own tests on the unpatched image (baseline)
@@ -182,7 +185,21 @@ that changes Plane files beyond `apps/api/plane/halo/` and the list in `release.
 
 ## Rollback
 
-Set the four backend services back to `makeplane/plane-backend:v1.4.2`. Page versions written by the
-patched build stay in `page_versions`; stock Plane reads them as normal versions. The tables
-`halo_page_text_behind` and `halo_page_being_copied` stay and are unused by stock Plane (drop them only when
-Halo's patch is retired).
+In levels (the Halo pages API plan, "Rollback, in levels", and the coordinator's `rollback-halo-pages.sh`):
+
+1. AURA's page actions only (the normal case): AURA's Halo instructions from their backup and plane-mcp back to
+   its previous image. Halo's backend stays patched; its web behaviour is Plane's, so nothing in Halo needs undoing.
+2. Only when the patch itself harms Halo's web use: the **api alone** goes back to
+   `makeplane/plane-backend:v1.4.2`, in a short maintenance window. The proxy stops (no person and no AURA call can
+   write), live's last stores reach the api for 30 s, then the api stops. The api switches only when no page is in
+   a Halo-only state (`halo_page_text_behind` rows of pages that are not deleted: stock Plane's duplicate would copy
+   the HTML without the part only the document has), no duplicate is unfinished (`halo_page_being_copied` is
+   empty) and no editor is connected to live; otherwise the api and the proxy run again and the pages are listed.
+   Worker and beat-worker **stay on the Halo image**: it runs Plane's own tasks as well as Halo's
+   (`finish_page_copy`, `index_restored_page`, `index_page`, `add_to_index`), so no queued, deferred or retried
+   task loses the worker that knows it.
+
+Do not set all four backend services back to stock: Halo's queued or deferred tasks would then have no worker,
+and stock duplicates could drop text that only a page's document holds. Page versions written by the patched
+build stay in `page_versions`; stock Plane reads them as normal versions. The tables `halo_page_text_behind` and
+`halo_page_being_copied` stay and are unused by stock Plane (drop them only when Halo's patch is retired).

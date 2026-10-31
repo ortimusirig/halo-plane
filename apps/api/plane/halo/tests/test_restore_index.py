@@ -274,3 +274,53 @@ def test_restore_retry_backoff_waits_indefinitely_with_capped_delay(world, retri
     assert retry.value.when == countdown
     assert retry.value.sig.options["retries"] == retries + 1
     assert retry.value.sig.kwargs == {"page_id": world.public.id}
+
+
+# ---- API edits that keep a component's id but change its target (code review 2026-10-31, P2 #1) -------------
+# Plane's page_transaction skips transaction ids already in the old HTML, so without a refresh the index kept the
+# old target. The edit now also queues the page-scoped reconciliation; Plane's own call stays.
+
+def indexed_component(world, element, attrs, html):
+    document = Doc()
+    document.apply_update(bytes(world.public.description_binary))
+    with document.transaction():
+        document.get(ydoc.BODY, type=XmlFragment).children.append(XmlElement(element, attrs))
+    Page.objects.filter(pk=world.public.pk).update(description_html=html, description_binary=document.get_update())
+    page_transaction(new_description_html=html, old_description_html=None, page_id=world.public.id)
+
+
+def retargeted_mention_html(target):
+    return (f'<p>Kept</p><mention-component id="{MENTION}" entity_name="issue" '
+            f'entity_identifier="{target}"></mention-component>')
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_api_edit_that_retargets_a_kept_mention_refreshes_the_index(world, fake_live, indexing_jobs, reverse):
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      retargeted_mention_html(TARGET))
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [TARGET]
+    edit(world, description_html=retargeted_mention_html(NEW_TARGET), allow_removal=True)
+    jobs = indexing_jobs()
+    names = [task.name for task, _, _ in jobs]
+    assert page_transaction.name in names and index_restored_page.name in names  # Plane's call is kept
+    run_jobs(list(reversed(jobs)) if reverse else jobs)  # either order the worker may run them in
+    assert world.owner.client.get(f"{world.base}{world.public.id}/").json()["work_item_ids"] == [NEW_TARGET]
+    assert PageLog.objects.filter(page_id=world.public.id, transaction=MENTION).count() == 1
+
+
+def test_api_edit_that_replaces_a_kept_image_refreshes_the_index(world, fake_live, indexing_jobs):
+    indexed_component(world, "imageComponent", {"id": MENTION, "src": TARGET},
+                      f'<p>Kept</p><image-component id="{MENTION}" src="{TARGET}"></image-component>')
+    edit(world, description_html=f'<p>Kept</p><image-component id="{MENTION}" src="{NEW_TARGET}"></image-component>',
+         allow_removal=True)
+    run_jobs(indexing_jobs())
+    image = PageLog.objects.get(page_id=world.public.id, transaction=MENTION)
+    assert image.entity_name == "image" and str(image.entity_identifier) == NEW_TARGET
+
+
+def test_api_edit_refresh_is_told_apart_from_a_restore(world, fake_live, indexing_jobs):
+    indexed_component(world, "mention-component", {"id": MENTION, "entity_name": "issue", "entity_identifier": TARGET},
+                      retargeted_mention_html(TARGET))
+    edit(world, description_html=retargeted_mention_html(NEW_TARGET), allow_removal=True)
+    refresh = [kwargs for task, _, kwargs in indexing_jobs() if task.name == index_restored_page.name]
+    assert refresh == [{"page_id": world.public.id, "after_edit": True}]

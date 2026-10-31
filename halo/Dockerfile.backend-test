@@ -1,6 +1,6 @@
 # Halo backend test image: the Halo backend image plus Plane's test tools (not deployed).
 # halo/test-backend.sh builds it; with --dev it starts from the upstream image and the source is mounted.
-ARG BASE_IMAGE=plane-backend-halo:v1.4.2-pages.1
+ARG BASE_IMAGE=plane-backend-halo:v1.4.2-pages.2
 FROM ${BASE_IMAGE}
 COPY requirements-halo.txt /tmp/requirements-halo.txt
 # Plane's requirements/test.txt pins; only the packages its tests import (no compilers in this image).

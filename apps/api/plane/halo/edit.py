@@ -309,6 +309,10 @@ def _edit_leased(page, user, expected_updated_at, html, name, append, allow_remo
                 page_transaction.delay(
                     new_description_html=full_html, old_description_html=old["description_html"], page_id=page.id
                 )
+                # page_transaction skips transaction ids already in the old HTML, so an edit that keeps a mention's
+                # or an image's id but changes its target would leave the old target indexed: the page-scoped
+                # reconciliation (the restore job's) refreshes the page's rows from its current text afterwards.
+                index_restored_page.delay(page_id=page.id, after_edit=True)
         except Exception as error:  # the mentions index only; the edit itself is saved
             log_exception(error)
     return {

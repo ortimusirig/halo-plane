@@ -3,7 +3,7 @@
 #
 #   bash halo/test-backend.sh [--dev] [pytest arguments]      (default arguments: plane/halo/tests)
 #
-# Without --dev it tests the built image plane-backend-halo:v1.4.2-pages.1 (halo/build-backend.sh).
+# Without --dev it tests the built image plane-backend-halo:v1.4.2-pages.2 (halo/build-backend.sh).
 # --dev tests the working tree instead: apps/api/plane is mounted over the upstream image's code.
 # --upstream tests the unpatched upstream image (a baseline for Plane's own tests).
 set -euo pipefail
@@ -11,7 +11,7 @@ export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 root=$(pwd -W 2>/dev/null || pwd)
 
-base=${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.1}
+base=${HALO_BACKEND_IMAGE:-plane-backend-halo:v1.4.2-pages.2}
 mount=()
 if [ "${1:-}" = "--dev" ]; then
   shift
